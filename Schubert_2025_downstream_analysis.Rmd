@@ -1,0 +1,2915 @@
+---
+title: "Downstream analysis"
+author: "Tim Schubert"
+date: "2024-12-30"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+# Project-rooted paths
+library(here)
+library(dplyr)
+library(tidyverse)
+
+output_dir <- here("output")
+plots_dir  <- file.path(output_dir, "plots")
+tables_dir <- file.path(output_dir, "tables")
+base_out   <- file.path(output_dir, "regression studies")
+data_dir   <- here("data")
+
+invisible(dir.create(output_dir, recursive = TRUE, showWarnings = FALSE))
+invisible(dir.create(plots_dir,  recursive = TRUE, showWarnings = FALSE))
+invisible(dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE))
+invisible(dir.create(base_out,   recursive = TRUE, showWarnings = FALSE))
+invisible(dir.create(data_dir,   recursive = TRUE, showWarnings = FALSE))
+
+```
+
+# Downstream analysis
+
+## Maintenance and Diagnostics
+
+### Load saved MAP output and variant list
+
+```{r load results_df, warning=FALSE, message=FALSE}
+results_df <- readRDS(file.path(output_dir, "results_df.rds"))
+variant_list <- read_csv("Variant_list.csv")
+```
+
+### Severity Score
+
+This is to analyze the impact of available information on severity outcomes.
+
+```{r severity-score-diagnostics, echo=TRUE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggridges)
+library(viridisLite)
+library(patchwork)
+library(grid)
+
+# data, colors
+
+smax_col <- intersect(c("max_achievable_points", "max achievable points"),
+                      names(variant_list)) |> dplyr::first()
+if (is.null(smax_col)) stop("No Smax column found in variant_list.")
+
+df_all <- variant_list %>%
+  transmute(
+    severity = as.numeric(severity),
+    Smax     = as.numeric(.data[[smax_col]])
+  ) %>%
+  tidyr::drop_na()
+
+
+cuts       <- seq(0, max(df_all$Smax), by = 5)
+cut_labels <- paste0("\u2265", cuts)
+pal        <- viridis(length(cuts), alpha = 0.65)
+names(pal) <- cut_labels
+
+# Ridgeline panel
+ridge_df <- map_dfr(cuts, \(c) 
+    df_all %>% 
+      filter(Smax >= c) %>% 
+      mutate(cut_lab = paste0("\u2265", c))
+  ) %>% 
+  mutate(cut_lab = factor(cut_lab, levels = cut_labels))
+
+p_ridge <- ggplot(ridge_df, aes(x = severity, y = cut_lab, fill = cut_lab)) +
+  geom_density_ridges(
+    scale = 3, rel_min_height = .01,
+    colour = "grey15", size = .3, alpha = .65
+  ) +
+  scale_fill_manual(values = pal, name = expression(S[max]*" threshold")) +
+  labs(
+    x = "Severity score  S",
+    y = expression("Lower bound on "*S[max])
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.y      = element_text(size = 8),
+    text             = element_text(face = "bold", family = "Helvetica")
+  )
+
+# Correlation panel
+corr_df <- map_dfr(cuts, function(c) {
+    d <- df_all %>% filter(Smax >= c)
+    if (nrow(d) < 4) return(tibble(cut = c, rho = NA, p = NA, n = nrow(d)))
+    ct <- cor.test(d$Smax, d$severity, method = "spearman")
+    tibble(
+      cut = c,
+      rho = unname(ct$estimate),
+      p   = ct$p.value,
+      n   = nrow(d)
+    )
+  }) %>% 
+  mutate(
+    z       = atanh(rho),
+    se      = 1 / sqrt(pmax(n - 3, 1)),
+    lo      = tanh(z - 1.96*se),
+    hi      = tanh(z + 1.96*se),
+    cut_lab = factor(paste0("\u2265", cut), levels = cut_labels)
+  )
+
+p_corr <- ggplot(corr_df, aes(x = cut, y = rho, colour = cut_lab)) +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey60") +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = .6, linewidth = .6) +
+  geom_point(
+    data = subset(corr_df, p >= .05),
+    size = 5, shape = 21, stroke = .9, fill = NA
+  ) +
+  geom_point(
+    data = subset(corr_df, p < .05),
+    aes(fill = cut_lab),
+    size = 5, shape = 21, stroke = .9
+  ) +
+  scale_colour_manual(values = pal, name = expression(S[max]*" threshold")) +
+  scale_fill_manual(values = pal, guide = "none") +
+  scale_x_continuous(breaks = cuts) +
+  labs(
+    x = expression("Lower bound on "*S[max]),
+    y = expression("Spearman "*rho)
+  ) +
+  theme_classic() +
+  theme(
+    text            = element_text(face = "bold", family = "Helvetica"),
+    axis.text       = element_text(colour = "black")
+  )
+
+# QQ‐plot panel
+thresholds <- cuts[1:6]
+th_labels  <- paste0("\u2265", thresholds)
+pal6       <- pal[th_labels]
+
+qq_df <- map_dfr(thresholds, function(cut) {
+    df_all %>% 
+      filter(Smax >= cut) %>% 
+      transmute(severity, cut_lab = paste0("\u2265", cut))
+  }) %>% 
+  mutate(cut_lab = factor(cut_lab, levels = th_labels))
+
+annot_df <- qq_df %>% 
+  count(cut_lab) %>% 
+  mutate(label = paste0("n = ", n))
+
+n_max        <- max(annot_df$n)
+theo_limits  <- qnorm(c(0.5/n_max, 1 - 0.5/n_max))
+sample_limits <- range(qq_df$severity)
+
+p_qq6 <- ggplot(qq_df, aes(sample = severity, colour = cut_lab)) +
+  stat_qq(size = 1.5, alpha = 0.6) +
+  stat_qq_line(size = 0.8) +
+  facet_wrap(~cut_lab, ncol = 3) +
+  geom_text(
+    data    = annot_df,
+    aes(x = Inf, y = -Inf, label = label),
+    hjust   = 1.1, vjust = -0.5,
+    size    = 3.5,
+    inherit.aes = FALSE
+  ) +
+  scale_colour_manual(
+    values = pal6,
+    name   = expression(S[max]*" threshold")
+  ) +
+  labs(
+    x = "Theoretical Quantiles",
+    y = "Sample Quantiles"
+  ) +
+  coord_cartesian(
+    xlim = theo_limits,
+    ylim = sample_limits
+  ) +
+  theme_classic(base_family = "Helvetica", base_size = 13) +
+  theme(
+    text            = element_text(face = "bold", colour = "black"),
+    axis.text       = element_text(colour = "black"),
+    axis.title      = element_text(colour = "black"),
+    strip.text      = element_text(size = 10, face = "bold"),
+    panel.border    = element_rect(fill = NA, colour = "black"),
+    panel.spacing   = unit(0.5, "lines"),
+    legend.position = "none",
+    aspect.ratio    = 1
+  )
+
+# save
+
+figure <- (p_ridge | p_qq6) / p_corr +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position   = "right",
+    legend.box.margin = margin(0, 10, 0, 0),
+    text              = element_text(face = "bold", family = "Helvetica")
+  )
+
+out_dir <- file.path(output_dir, "severity score diagnostics")
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+ggsave(
+  filename = file.path(out_dir, "severity_score_diagnostics_full.png"),
+  plot     = figure,
+  width    = 10,
+  height   = 12,
+  dpi      = 300
+)
+```
+
+```{r retention-curve, echo=TRUE, message=FALSE, warning=FALSE}
+
+suppressPackageStartupMessages({ library(scales) })
+
+smax_max   <- ceiling(max(df_all$Smax, na.rm = TRUE))
+fine_cuts  <- seq(0, smax_max, by = 1)
+
+km_fine <- tibble(cut = fine_cuts) %>%
+    rowwise() %>%
+    mutate(n = sum(df_all$Smax >= cut, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(
+        frac = if (max(n) > 0) n / max(n) else NA_real_
+    )
+
+# markers 
+km_marks <- tibble(cut = sort(cuts)) %>%
+    rowwise() %>%
+    mutate(n = sum(df_all$Smax >= cut, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(
+        frac    = n / max(n),
+        cut_lab = factor(paste0("\u2265", cut), levels = cut_labels)
+    )
+
+n0 <- km_fine$n[1]
+
+p_km_separate <- ggplot() +
+    # 1-point resolution step curve
+    geom_step(data = km_fine, aes(x = cut, y = frac), linewidth = 0.4) +
+    geom_point(
+        data   = km_marks,
+        aes(x = cut, y = frac, colour = cut_lab),
+        size   = 3, stroke = 0.9
+    ) +
+    scale_colour_manual(values = pal, name = expression(S[max]*" threshold")) +
+    scale_x_continuous(breaks = cuts) +
+    scale_y_continuous(
+        labels  = percent_format(accuracy = 1),
+        limits  = c(0, 1),
+        sec.axis = sec_axis(~ . * n0, name = "Individuals retained (n)")
+    ) +
+    labs(
+        x = expression("Lower bound on "*S[max]),
+        y = "Fraction of cohort retained",
+        title = "Retention vs. Smax threshold"
+    ) +
+    theme_classic() +
+    theme(
+        text            = element_text(face = "bold", family = "Helvetica"),
+        axis.text       = element_text(colour = "black"),
+        axis.title      = element_text(colour = "black"),
+        legend.position = "right"
+    )
+
+# Save 
+out_dir <- file.path(output_dir, "severity score diagnostics")
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+ggsave(
+    filename = file.path(out_dir, "severity_retention_curve_narrow.png"),
+    plot     = p_km_separate,
+    width    = 4,     
+    height   = 3.2,  
+    dpi      = 300
+)
+
+```
+
+Given the outcome, we consider the severity values for patients with max. achievable points \< 10 as NA.
+
+```{r replace-severity-below-threshold, message=FALSE, warning=FALSE}
+library(dplyr)
+
+# Replace severity with NA for patients with max_achievable_points < 10
+results_df <- results_df %>%
+  mutate(severity = if_else(max_achievable_points < 10, NA_real_, severity))
+
+# Preview
+head(results_df)
+```
+
+### Renaming variables for clarity
+
+```{r rename-symptoms, message=FALSE, warning=FALSE}
+library(dplyr)
+
+# rename map
+original_rename_map <- c(
+  "DD_(any)" = "DD",
+  "DD_(motor_delay)" = "motor delay",
+  "DD_(speech_delay)" = "delayed speech",
+  "ID_(any)" = "ID",
+  "muscular_hypotonia" = "hypotonia",
+  "feeding_difficulties_except_hyperphagia" = "feeding difficulties",
+  "overweight_issues" = "overweight",
+  "short_or_characteristic_hands_or_feet" = "short extremities",
+  "dysmorphic_features" = "dysmorphism",
+  "contractures_or_arthrogryposis" = "contractures",
+  "scoliosis_or_kyphosis" = "scoliosis",
+  "seizures_or_epilepsy" = "epilepsy",
+  "ocular_anomalies" = "ocular issues",
+  "genitourinary_anomalies" = "genitourinary issues",
+  "endocrine_or_metabolic_dysfunction_(any)" = "endocrine issues",
+  "hypoglycemia_or_hyperinsulinism" = "hypoglycemia",
+  "underweight issues" = "underweight"
+)
+
+flipped_rename_map <- setNames(names(original_rename_map), original_rename_map)
+
+# Filter the flipped map to include only columns that exist in results_df.
+existing_rename <- flipped_rename_map[flipped_rename_map %in% colnames(results_df)]
+
+# Create a new data frame with clean variable names.
+results_df_w_clean_names <- results_df %>% rename(!!!existing_rename)
+
+# Read the variable categorization CSV file.
+var_cat <- read_csv(file.path(data_dir, "variable_categorization_with_additional_info.csv"))
+
+if("Clean_Name" %in% colnames(var_cat)){
+  message("Column 'Clean_Name' exists; updating its values.")
+} else {
+  message("Column 'Clean_Name' does not exist; adding new column.")
+}
+
+# Add the Clean_Name column:
+var_cat <- var_cat %>% 
+  mutate(Clean_Name = if_else(Variable %in% names(original_rename_map),
+                              original_rename_map[Variable],
+                              gsub("_", " ", Variable)))
+
+# write csv
+write_csv(var_cat, file.path(data_dir, "variable_categorization_with_additional_info.csv"))
+cat("Updated variable categorization file saved with 'Clean_Name' column.\n")
+# Print new column names for verification.
+print(colnames(results_df_w_clean_names))
+```
+
+### Clean-up "lost domains" col
+
+```{r clean-lost-domains, message=FALSE, warning=FALSE}
+library(dplyr)
+library(stringr)
+library(purrr)
+
+results_df <- results_df %>%
+  # 1) keep a copy of the original
+  mutate(orig_Lost_Functional_Domains = Lost_Functional_Domains) %>%
+  
+  # 2) rebuild Lost_Functional_Domains with u7bs_mhd → u7bs + mhd, drop after_mhd
+  mutate(
+    Lost_Functional_Domains = case_when(
+      is.na(orig_Lost_Functional_Domains) ~ NA_character_,
+      TRUE ~ orig_Lost_Functional_Domains %>%
+        str_split(",\\s*") %>% 
+        map_chr(function(parts) {
+          # remove after_mhd
+          parts <- setdiff(parts, "after_mhd")
+          
+          # if u7bs_mhd was in the original, remove it and add u7bs & mhd
+          if ("u7bs_mhd" %in% parts) {
+            parts <- setdiff(parts, "u7bs_mhd")
+            parts <- c(parts, "u7bs", "mhd")
+          }
+          
+          # drop duplicates, handle empty → NA, else re-join
+          parts <- unique(parts)
+          if (length(parts) == 0) NA_character_
+          else paste(parts, collapse = ", ")
+        })
+    )
+  )
+
+# Quick check
+results_df %>%
+  select(orig_Lost_Functional_Domains, Lost_Functional_Domains) %>%
+  head()
+
+```
+
+### Fix previous frameshift analysis issue
+
+Ensure there are no "0" values in frameshift length (could previously be the case for very specific constellations and is correct in principle but we do not want to include these patients in analyses of frameshift length but instead only perform the frameshift length analysis for patients with a true frameshifting indel variant). This is fixed in the updated version of the MfAP pipeline.
+
+```{r replace-frameshift-zeros, echo=TRUE, message=FALSE}
+# Show how many zeros are present before replacement
+zeros_before <- sum(results_df$`Frameshift_Length_[aa]` == 0, na.rm = TRUE)
+cat("Zeros before replacement:", zeros_before, "\n")
+
+# Replace zeros with NA
+results_df$`Frameshift_Length_[aa]`[results_df$`Frameshift_Length_[aa]` == 0] <- NA
+
+# Show counts after replacement
+zeros_after <- sum(results_df$`Frameshift_Length_[aa]` == 0, na.rm = TRUE)
+nas_after  <- sum(is.na(results_df$`Frameshift_Length_[aa]`))
+cat("Zeros after replacement:", zeros_after, "\n")
+cat("NAs after replacement:", nas_after, "\n")
+```
+
+## Further Downstream Analysis
+
+### Descriptive statistics on genotype variables
+
+```{r genotype_descriptives_and_save, message=FALSE, warning=FALSE}
+
+library(tidyverse)
+library(janitor)
+library(knitr)
+library(writexl)
+
+# 1) Identify Genotype variables and split by type
+geno_vars      <- var_cat %>% filter(Genotype_or_Phenotype == "Genotype")
+cat_geno_vars  <- geno_vars %>% filter(str_detect(Type, "Cate|Bina")) %>% pull(Variable)
+cont_geno_vars <- geno_vars %>% filter(str_detect(Type, "Cont"))         %>% pull(Variable)
+
+# 2A) Continuous genotype variable summaries
+cont_summary <- map_dfr(cont_geno_vars, function(var) {
+  vec <- results_df[[var]]
+  tibble(
+    Variable = var,
+    n        = sum(!is.na(vec)),
+    mean     = mean(vec, na.rm = TRUE),
+    sd       = sd(vec,   na.rm = TRUE),
+    median   = median(vec, na.rm = TRUE),
+    IQR      = IQR(vec,    na.rm = TRUE),
+    min      = min(vec,    na.rm = TRUE),
+    max      = max(vec,    na.rm = TRUE)
+  )
+}) %>%
+  left_join(var_cat %>% select(Variable, Clean_Name), by = "Variable") %>%
+  select(Clean_Name, everything(), -Variable)
+
+# 2B) Categorical (including binary) genotype variable summaries
+cat_summary <- map_dfr(cat_geno_vars, function(var) {
+  levs <- as.character(results_df[[var]])
+  tb   <- table(levs, useNA = "no")
+  tibble(
+    Variable = var,
+    Level    = names(tb),
+    Count    = as.integer(tb)
+  )
+}) %>%
+  group_by(Variable) %>%
+  mutate(Percent = round(Count / sum(Count) * 100, 1)) %>%
+  ungroup() %>%
+  left_join(var_cat %>% select(Variable, Clean_Name), by = "Variable") %>%
+  select(Clean_Name, Level, Count, Percent)
+
+# 3) Print tables in the report
+kable(cont_summary, caption = "Descriptive statistics for continuous genotype variables", 
+      col.names = c("Variable", "n", "Mean", "SD", "Median", "IQR", "Min", "Max"))
+kable(cat_summary,  caption = "Counts and percentages for categorical genotype variables", 
+      col.names = c("Variable", "Level", "Count", "Percent"))
+
+# 4) Save both summaries to an Excel file
+save_path <- file.path(tables_dir, "descriptive statistics on genotype variables.xlsx")
+dir.create(dirname(save_path), recursive = TRUE, showWarnings = FALSE)
+write_xlsx(
+  list(
+    Continuous  = cont_summary,
+    Categorical = cat_summary
+  ),
+  path = save_path
+)
+```
+
+### Phenotype by sex
+
+Using the variable categorization, results_df is filtered for those variables where Measure is "Prevalence". For each symptom, the ratio of affected individuals to observed individuals, the prevalence (%), and 95% confidence intervals are computed (using Wilson score intervals).
+
+**Symptom Prevalence by Sex.** Boschloo's test is used P-values are adjusted using Benjamini-Hochberg.
+
+```{r sex-specific symptom-prevalence-table, message=FALSE, warning=FALSE}
+library(dplyr)
+library(readr)
+library(openxlsx)
+library(binom)
+library(exact2x2)   
+
+# 1) Read the variable categorization file
+var_cat <- read_csv(file.path(data_dir, "variable_categorization_with_additional_info.csv"))
+
+# 2) Build a lookup from raw-variable-name ➔ Clean_Name
+name_map <- setNames(var_cat$Clean_Name, var_cat$Variable)
+
+# 3) Filter only those variables measured as "Prevalence"
+symptom_vars <- var_cat %>% 
+  filter(Measure == "Prevalence") %>% 
+  pull(Variable)
+
+# Helper to compute ratio, % prevalence, and 95% CI (Wilson)
+compute_prevalence_stats <- function(x) {
+  n_obs    <- sum(!is.na(x))
+  n_aff    <- sum(x == 1, na.rm = TRUE)
+  if (n_obs == 0) {
+    return(list(ratio = "NA", prevalence = NA, ci = "NA", n_obs = 0))
+  }
+  ratio      <- paste0(n_aff, "/", n_obs)
+  prevalence <- round((n_aff / n_obs) * 100, 1)
+  bt         <- binom.confint(n_aff, n_obs, methods = "wilson")
+  ci_str     <- paste0(round(bt$lower * 100, 1), "-", round(bt$upper * 100, 1))
+  list(ratio = ratio, prevalence = prevalence, ci = ci_str, n_obs = n_obs)
+}
+
+# 4) Loop over each symptom variable:
+symptom_stats <- lapply(symptom_vars, function(symp) {
+  # 4a) Determine the name:
+  if (symp %in% names(name_map)) {
+    symptom_name <- name_map[[symp]]
+  } else {
+    symptom_name <- gsub("_", " ", symp)
+  }
+  
+  # 4b) Compute overall/female/male prevalence stats
+  overall_stats <- compute_prevalence_stats(results_df[[symp]])
+  female_stats  <- compute_prevalence_stats(results_df[[symp]][results_df$sex == "f"])
+  male_stats    <- compute_prevalence_stats(results_df[[symp]][results_df$sex == "m"])
+  
+  # 4c) Build 2×2 contingency table (rows = Absent/Present, cols = Female/Male)
+  female_vals <- results_df[[symp]][results_df$sex == "f"]
+  male_vals   <- results_df[[symp]][results_df$sex == "m"]
+  count0_f <- sum(female_vals == 0, na.rm = TRUE)
+  count1_f <- sum(female_vals == 1, na.rm = TRUE)
+  count0_m <- sum(male_vals == 0, na.rm = TRUE)
+  count1_m <- sum(male_vals == 1, na.rm = TRUE)
+  
+  # Extract counts for boschloo(): successes + total per group
+  x1 <- count1_f
+  n1 <- count1_f + count0_f
+  x2 <- count1_m
+  n2 <- count1_m + count0_m
+  
+  # 4d) Run Fisher–Boschloo test if there is at least one observation.
+  test_used    <- NA
+  p_val        <- NA
+  min_expected <- NA
+  if ((n1 + n2) > 0) {
+    # Call boschloo(x1, n1, x2, n2). Default = two-sided.
+    boschloo_res <- suppressWarnings(
+      exact2x2::boschloo(x1, n1, x2, n2, alternative = "two.sided")
+    )
+    test_used <- "Boschloo"
+    p_val     <- boschloo_res$p.value
+    
+    # Smallest expected count (for reference):
+    tab        <- matrix(c(count0_f, count0_m, count1_f, count1_m),
+                         nrow = 2, byrow = TRUE)
+    chisq_res  <- suppressWarnings(chisq.test(tab, correct = FALSE))
+    min_expected <- min(chisq_res$expected)
+  } else {
+    test_used <- "Insufficient data"
+  }
+  
+  # 4e) Return a one-row data.frame
+  data.frame(
+    Symptom            = symptom_name,
+    Female_Ratio       = female_stats$ratio,
+    Female_Prevalence  = female_stats$prevalence,
+    Female_CI          = female_stats$ci,
+    Female_n           = female_stats$n_obs,
+    Male_Ratio         = male_stats$ratio,
+    Male_Prevalence    = male_stats$prevalence,
+    Male_CI            = male_stats$ci,
+    Male_n             = male_stats$n_obs,
+    Overall_Ratio      = overall_stats$ratio,
+    Overall_Prevalence = overall_stats$prevalence,
+    Overall_CI         = overall_stats$ci,
+    Overall_n          = overall_stats$n_obs,
+    TestUsed           = test_used,
+    p_value            = p_val,
+    min_expected       = min_expected,
+    stringsAsFactors   = FALSE
+  )
+})
+
+symptom_prevalence_df <- bind_rows(symptom_stats)
+
+# 5) FDR correction (BH) across all p-values
+symptom_prevalence_df <- symptom_prevalence_df %>%
+  dplyr::mutate(
+    q_value = p.adjust(p_value, method = "BH")
+  )
+
+# 6) Create Excel workbook and worksheet
+wb <- createWorkbook()
+addWorksheet(wb, "Prevalence")
+
+# 7) Compute sample sizes for header annotation
+female_n  <- sum(results_df$sex == "f", na.rm = TRUE)
+male_n    <- sum(results_df$sex == "m", na.rm = TRUE)
+overall_n <- sum(!is.na(results_df$sex))
+
+# 8) Write the main data frame
+writeDataTable(
+  wb, sheet = "Prevalence",
+  x = symptom_prevalence_df,
+  startRow = 4, tableStyle = "none"
+)
+
+# 9) Top‐level header (row 1), grouping columns into Female / Male / Overall / Tests
+top_header <- c(
+  " ", 
+  "Female", "", "", "",
+  "Male",   "", "", "",
+  "Overall","", "", "",
+  "Tests",  "", "", ""
+)
+top_header[top_header == ""] <- " "
+writeData(
+  wb, sheet = "Prevalence",
+  x = as.data.frame(t(top_header)),
+  startRow = 1, startCol = 1, colNames = FALSE
+)
+mergeCells(wb, sheet = "Prevalence", cols = 2:5, rows = 1)
+mergeCells(wb, sheet = "Prevalence", cols = 6:9, rows = 1)
+mergeCells(wb, sheet = "Prevalence", cols = 10:13, rows = 1)
+mergeCells(wb, sheet = "Prevalence", cols = 14:17, rows = 1)
+
+# 10) Second header row (row 2) for sample sizes & test‐column labels
+group_n <- c(
+  " ",
+  paste0("n = ", female_n), "", "", "",
+  paste0("n = ", male_n),   "", "", "",
+  paste0("n = ", overall_n),"", "", "",
+  "Test used", "p-value", "min exp", "q-value"
+)
+writeData(
+  wb, sheet = "Prevalence",
+  x = as.data.frame(t(group_n)),
+  startRow = 2, startCol = 1, colNames = FALSE
+)
+
+# 11) Third header row (row 3) with the actual column names
+sub_header <- c(
+  "Symptom",
+  "Ratio", "Prevalence (%)", "95% CI", "n",
+  "Ratio", "Prevalence (%)", "95% CI", "n",
+  "Ratio", "Prevalence (%)", "95% CI", "n",
+  "Test", "p", "min exp", "q-value"
+)
+writeData(
+  wb, sheet = "Prevalence",
+  x = as.data.frame(t(sub_header)),
+  startRow = 3, startCol = 1, colNames = FALSE
+)
+
+# 12) Auto‐adjust column widths
+setColWidths(wb, sheet = "Prevalence", cols = 1:17, widths = "auto")
+
+# 13) Save
+output_file <- file.path(tables_dir, "sex_specific_symptom_prevalence.xlsx")
+saveWorkbook(wb, file = output_file, overwrite = TRUE)
+
+cat("Symptom prevalence table saved to:", output_file, "\n")
+```
+
+**Milestones by Sex.** FDR correction for statistics, which were themselves performed in PRISM 10.
+
+```{r milestones q values, message=FALSE, warning=FALSE}
+library(readr)
+library(dplyr)
+
+# 1. Read in CSV
+input_path  <- file.path(data_dir,"milestones.csv")
+milestones  <- read_csv(input_path)
+
+# 2. Perform Benjamini–Hochberg correction on the "p_value" column
+milestones  <- milestones %>%
+  mutate(
+    q_value = p.adjust(p_value, method = "BH")
+  )
+
+# 3. Write back
+output_path <- "milestones_updated.csv"
+write_csv(milestones, output_path)
+
+head(milestones)
+```
+
+**Generation of sex-specific Radar Chart.** Only includes symptoms for which there are at least 5 observations in each group.
+
+```{r sex-radar-chart-simple-exclude, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(scales)
+library(ggradar)
+library(tibble)
+library(readr)
+library(openxlsx)
+
+# Replace any remaining underscores with spaces in the Symptom column.
+symptom_prevalence_df <- symptom_prevalence_df %>% 
+  mutate(Symptom = gsub("_", " ", Symptom)) %>%
+  filter(!Symptom %in% c("death during pregnancy", "severe sleep apnea",
+                         "severe respiratory distress", "hypogonadism")) %>%
+  filter(Female_n >= 5, Male_n >= 5) %>%
+  distinct(Symptom, .keep_all = TRUE)
+
+# Exclude specific variables from the radar chart due to repetitiveness (strong overlap with other variables)
+exclude_vars <- c("death during pregnancy", "severe sleep apnea", "severe respiratory distress", "hypogonadism")
+symptom_prevalence_df <- symptom_prevalence_df %>% filter(!Symptom %in% exclude_vars)
+
+symptom_order <- symptom_prevalence_df$Symptom
+
+female_df <- symptom_prevalence_df %>%
+  select(Symptom, Female_Prevalence) %>%
+  pivot_wider(names_from = Symptom, values_from = Female_Prevalence) %>%
+  mutate(Group = "Female")
+
+male_df <- symptom_prevalence_df %>%
+  select(Symptom, Male_Prevalence) %>%
+  pivot_wider(names_from = Symptom, values_from = Male_Prevalence) %>%
+  mutate(Group = "Male")
+
+# Bind + reorder 
+radar_df <- bind_rows(female_df, male_df) %>%
+  select(Group, any_of(symptom_order))
+
+# Scale prevalence values from percentages to 0–1.
+radar_df[,-1] <- radar_df[,-1] / 100
+radar_df[is.na(radar_df)] <- 0
+
+# Create the radar chart
+p <- ggradar(
+  radar_df,
+  grid.min = 0,
+  grid.mid = 0.5,
+  grid.max = 1,
+  values.radar = c("0%", "50%", "100%"),
+  axis.label.size = 6,      
+  axis.label.offset = 1.15,     
+  legend.position = "bottom",
+  legend.text.size = 10,
+  plot.legend = TRUE,
+  plot.extent.x.sf = 1.3,
+  plot.extent.y.sf = 1.3,
+  plot.title = "",
+  gridline.min.linetype = "dashed",
+  gridline.mid.linetype = "dashed",
+  gridline.max.linetype = "dashed",
+  gridline.min.colour = "grey70",
+  gridline.mid.colour = "grey70",
+  gridline.max.colour = "grey70",
+  background.circle.colour = "grey90",
+  background.circle.transparency = 0.2,
+  group.colours = c("Female" = "#D81B60", "Male" = "#1E88E5"),
+  fill = TRUE,
+  fill.alpha = 0.25,
+  group.point.size = 0
+) +
+  scale_fill_manual(values = c("Female" = "#D81B60", "Male" = "#1E88E5")) +
+  scale_color_manual(values = c("Female" = "#D81B60", "Male" = "#1E88E5")) +
+  guides(fill = guide_legend(title = NULL), color = guide_legend(title = NULL))
+
+# Save
+plots_dir <- file.path(output_dir, "plots")
+if(!dir.exists(plots_dir)) {
+  dir.create(plots_dir, recursive = TRUE)
+}
+output_file <- file.path(plots_dir, "radar_plot_simple_exclude.png")
+ggsave(filename = output_file, plot = p, width = 15, height = 15, dpi = 300)
+
+cat("Radar plot saved to:", output_file, "\n")
+
+p
+
+```
+
+### Severity by genotype variables 
+
+#### Categorical genotype variables
+
+For categorical genotype variables, analysis (ANOVA) was performed in PRISM 10.
+
+#### Continuous genotype variables
+
+Standard Diagnostics:
+
+```{r linear-regression-diagnostics, warning=FALSE}
+
+# 1. Define diagnostics output directories
+diag_out      <- file.path(base_out, "diagnostics")
+combined_diag <- file.path(diag_out, "combined")
+female_diag   <- file.path(diag_out, "female")
+male_diag     <- file.path(diag_out, "male")
+
+dir.create(combined_diag, recursive = TRUE, showWarnings = FALSE)
+dir.create(female_diag,   recursive = TRUE, showWarnings = FALSE)
+dir.create(male_diag,     recursive = TRUE, showWarnings = FALSE)
+
+geno_cont_vars<-c("Locus", "Protein_Length_[aa]", "Frameshift_Length_[aa]")
+
+# 2. Loop over each continuous genotype variable
+purrr::walk(geno_cont_vars, function(var) {
+  # prepare data
+  df_var <- results_df %>%
+    dplyr::select(sex, severity, !!rlang::sym(var)) %>%
+    dplyr::rename(predictor = !!rlang::sym(var)) %>%
+    tidyr::drop_na()
+
+  # skip variables with insufficient data
+  if (nrow(df_var) < 2) return()
+
+  # fit models only where at least 2 cases exist
+  fits <- list(
+    Combined = df_var,
+    Female   = df_var %>% dplyr::filter(sex == "f"),
+    Male     = df_var %>% dplyr::filter(sex == "m")
+  ) %>%
+    purrr::keep(~ nrow(.x) >= 2) %>%
+    purrr::imap(~ stats::lm(severity ~ predictor, data = .x))
+
+  # save per group
+  purrr::iwalk(fits, function(fit, grp) {
+    out_dir  <- switch(grp,
+                       Combined = combined_diag,
+                       Female   = female_diag,
+                       Male     = male_diag)
+    png_file <- file.path(out_dir, paste0("diag_", tolower(grp), "_", var, ".png"))
+
+    png(filename = png_file,
+        width    = 10, height = 10, units = "in",
+        res      = 300, type = "cairo")
+
+    par(mfrow = c(2, 2),
+        oma   = c(0, 0, 4, 0), 
+        mar   = c(5, 4, 2, 1)) 
+
+    plot(fit,
+         which       = c(1, 2, 3, 5),
+         caption     = "",
+         sub.caption = "",
+         ask         = FALSE)
+
+    mtext(
+      text   = paste("Diagnostics for", grp, "model on", var),
+      side   = 3,
+      outer  = TRUE,
+      line   = 2,
+      font   = 2,
+      cex    = 1.4
+    )
+
+    dev.off()
+  })
+})
+```
+
+→ Protein_Length_from_most_likely_non_canonical_TIS not suitable
+
+**Linear Regression**
+
+We define 3 continuous genotype variables of interest. Others are either perfectly correlated with another variable or have too many missing values. We then fit sex-by-genotype interaction models (**Severity** \~ predictor x sex) for these continuous genotype variables, and extract sex-specific slopes, the marginal (population-average) slope via `emmeans::emtrends()`, and the interaction effect from the linear model. We calculate q values within each effect family using the Benjamini-Hochberg method
+
+```{r interaction-with-counts-and-diagnostics, message=TRUE, warning=FALSE}
+
+library(dplyr)
+library(broom)
+library(emmeans)
+library(tidyr)
+library(purrr)
+library(openxlsx)
+library(ggplot2)
+library(scales)
+
+# Define genotype variables and output directories
+geno_vars <- c("Locus", "Protein_Length_[aa]", "Frameshift_Length_[aa]")
+base_out     <- file.path(output_dir, "regression studies")
+int_out      <- file.path(base_out, "interaction regression (selected geno × sex)")
+fig_combined <- file.path(int_out, "figures/combined")
+fig_by_sex   <- file.path(int_out, "figures/by_sex")
+sex_colors   <- c(f = "#D81B60", m = "#1E88E5")
+
+dirs <- c(int_out, fig_combined, fig_by_sex)
+purrr::walk(dirs, ~ if (!dir.exists(.x)) { dir.create(.x, recursive=TRUE); message("Created ", .x) } else message(.x, " exists"))
+
+# Prepare data
+df_reg <- results_df %>%
+  select(patient_ID, sex, severity, all_of(geno_vars)) %>%
+  filter(!is.na(severity)) %>%
+  mutate(sex = factor(sex, levels = c("f","m")))
+
+# Fit models, extract slopes, compute counts
+interaction_res <- purrr::map_dfr(geno_vars, function(var) {
+  df_var <- df_reg %>% select(severity, sex, predictor = !!sym(var)) %>% drop_na()
+  n_total  <- nrow(df_var)
+  n_female <- sum(df_var$sex == "f")
+  n_male   <- sum(df_var$sex == "m")
+  if (n_distinct(df_var$sex) < 2 || length(unique(df_var$predictor)) < 2) {
+    return(tibble(
+      Variable       = var,
+      n_total        = n_total,
+      n_female       = n_female,
+      n_male         = n_male,
+      Term           = c("FemSlope","MaleSlope","MarginalSlope","Interaction"),
+      Estimate       = NA_real_,
+      SE             = NA_real_,
+      df             = NA_real_,
+      lower.CL       = NA_real_,
+      upper.CL       = NA_real_,
+      p.value        = NA_real_,
+      q.value        = NA_real_,
+      R2             = NA_real_
+    ))
+  }
+  # Fit model
+  fit <- lm(severity ~ predictor * sex, data = df_var)
+  r2  <- summary(fit)$r.squared
+
+  # Sex-specific slopes
+  et  <- emtrends(fit, ~sex, var = "predictor")
+  thr <- summary(et, infer = TRUE) %>% rename(trend = predictor.trend)
+
+  # Marginal slope
+  emm <- emtrends(fit, ~1, var = "predictor")
+  mar <- summary(emm, infer = TRUE) %>% rename(trend = predictor.trend)
+
+  # Interaction
+  it <- tidy(fit, conf.int = TRUE) %>%
+    filter(term == "predictor:sexm") %>%
+    transmute(
+      Term      = "Interaction",
+      Estimate  = estimate,
+      SE        = std.error,
+      df        = NA_real_,
+      lower.CL  = conf.low,
+      upper.CL  = conf.high,
+      p.value   = p.value
+    )
+
+  # Combine rows
+  bind_rows(
+    tibble(
+      Variable = var, n_total = n_total, n_female = n_female, n_male = n_male,
+      Term     = "FemSlope",
+      Estimate = thr$trend[thr$sex == "f"],
+      SE       = thr$SE[thr$sex == "f"],
+      df       = thr$df[thr$sex == "f"],
+      lower.CL = thr$lower.CL[thr$sex == "f"],
+      upper.CL = thr$upper.CL[thr$sex == "f"],
+      p.value  = thr$p.value[thr$sex == "f"]
+    ),
+    tibble(
+      Variable = var, n_total = n_total, n_female = n_female, n_male = n_male,
+      Term     = "MaleSlope",
+      Estimate = thr$trend[thr$sex == "m"],
+      SE       = thr$SE[thr$sex == "m"],
+      df       = thr$df[thr$sex == "m"],
+      lower.CL = thr$lower.CL[thr$sex == "m"],
+      upper.CL = thr$upper.CL[thr$sex == "m"],
+      p.value  = thr$p.value[thr$sex == "m"]
+    ),
+    tibble(
+      Variable = var, n_total = n_total, n_female = n_female, n_male = n_male,
+      Term     = "MarginalSlope",
+      Estimate = mar$trend,
+      SE       = mar$SE,
+      df       = mar$df,
+      lower.CL = mar$lower.CL,
+      upper.CL = mar$upper.CL,
+      p.value  = mar$p.value
+    ),
+    it %>% mutate(Variable = var, n_total = n_total, n_female = n_female, n_male = n_male)
+  ) %>% mutate(R2 = r2)
+})
+
+# 6. BH-adjust p-values within each term
+interaction_res <- interaction_res %>%
+  group_by(Term) %>%
+  mutate(q.value = p.adjust(p.value, method = "BH")) %>%
+  ungroup()
+
+# 7. Pivot to wide and reorder columns
+summary_wide <- interaction_res %>%
+  pivot_wider(
+    id_cols    = c(Variable, n_total, n_female, n_male, R2),
+    names_from = Term,
+    values_from= c(Estimate, SE, lower.CL, upper.CL, p.value, q.value),
+    names_glue = "{Term}_{.value}"
+  ) %>%
+  select(
+    Variable, n_total, n_female, n_male, R2,
+    # FemSlope 
+    starts_with("FemSlope_Estimate"), starts_with("FemSlope_SE"),
+    starts_with("FemSlope_lower.CL"), starts_with("FemSlope_upper.CL"),
+    starts_with("FemSlope_p.value"), starts_with("FemSlope_q.value"),
+    # MaleSlope 
+    starts_with("MaleSlope_Estimate"), starts_with("MaleSlope_SE"),
+    starts_with("MaleSlope_lower.CL"), starts_with("MaleSlope_upper.CL"),
+    starts_with("MaleSlope_p.value"), starts_with("MaleSlope_q.value"),
+    # MarginalSlope 
+    starts_with("MarginalSlope_Estimate"), starts_with("MarginalSlope_SE"),
+    starts_with("MarginalSlope_lower.CL"), starts_with("MarginalSlope_upper.CL"),
+    starts_with("MarginalSlope_p.value"), starts_with("MarginalSlope_q.value"),
+    # Interaction 
+    starts_with("Interaction_Estimate"), starts_with("Interaction_SE"),
+    starts_with("Interaction_lower.CL"), starts_with("Interaction_upper.CL"),
+    starts_with("Interaction_p.value"), starts_with("Interaction_q.value")
+  )
+print(head(summary_wide))
+
+# 8. Write Excel
+out_file <- file.path(int_out, "selected_geno_sex_interaction_summary.xlsx")
+write.xlsx(summary_wide, file = out_file, overwrite = TRUE)
+message("Wrote Excel to: ", out_file)
+message("Excel exists? ", file.exists(out_file))
+
+# 9. Plotting
+for (var in geno_vars) {
+  df_var <- df_reg %>% select(severity, sex, predictor = !!sym(var)) %>% drop_na()
+  if (nrow(df_var) < 2 || length(unique(df_var$predictor)) < 2) next
+  p_int <- summary_wide %>% filter(Variable == var) %>% pull(Interaction_p.value)
+  new_x <- seq(min(df_var$predictor), max(df_var$predictor), length.out = 200)
+  fit_c <- lm(severity ~ predictor, data = df_var)
+  pr_c  <- predict(fit_c, newdata = data.frame(predictor = new_x), se.fit = TRUE)
+  z95   <- qnorm(0.975)
+  plot_c <- tibble(
+    predictor = new_x,
+    fit       = pr_c$fit,
+    lower     = pr_c$fit - z95 * pr_c$se.fit,
+    upper     = pr_c$fit + z95 * pr_c$se.fit
+  )
+  pt_map <- aes(x = predictor, y = severity, shape = sex, fill = sex, color = sex)
+
+  if (!is.na(p_int) && p_int < 0.05) {
+    for (s in c("f","m")) {
+      df_s <- filter(df_var, sex == s)
+      if (nrow(df_s) < 2) next
+      fit_s <- lm(severity ~ predictor, data = df_s)
+      pr_s  <- predict(fit_s, newdata = data.frame(predictor = new_x), se.fit = TRUE)
+      plot_s <- tibble(
+        predictor = new_x,
+        fit       = pr_s$fit,
+        lower     = pr_s$fit - z95 * pr_s$se.fit,
+        upper     = pr_s$fit + z95 * pr_s$se.fit
+      )
+      p <- ggplot(df_s, pt_map) +
+        geom_point(size = 2, stroke = 0.5, alpha = 0.28) +
+        scale_shape_manual(values = c(f = 21, m = 22)) +
+        scale_fill_manual(values = sex_colors) +
+        scale_color_manual(values = sex_colors) +
+        geom_ribbon(data = plot_s,
+                    aes(x = predictor, ymin = lower, ymax = upper),
+                    inherit.aes = FALSE, fill = "black", alpha = 0.1) +
+        geom_line(data = plot_s,
+                  aes(x = predictor, y = fit),
+                  inherit.aes = FALSE, color = "black", size = 1) +
+        scale_x_continuous(expand = expansion(mult = c(0, 0.05)),
+                           limits = c(0, NA),
+                           breaks = pretty_breaks(n = 5),
+                           minor_breaks = pretty_breaks(n = 10)) +
+        scale_y_continuous(limits = c(0, 1),
+                           breaks = seq(0, 1, 0.2),
+                           minor_breaks = seq(0, 1, 0.1)) +
+        labs(
+          title = paste(var, "–", ifelse(s == "f", "Female", "Male"),
+                        "interaction p=", sprintf("%.3f", p_int)),
+          x     = var,
+          y     = "Severity"
+        ) +
+        theme_minimal(base_size = 18, base_family = "Arial") +
+        theme(
+          text       = element_text(face = "bold"),
+          panel.grid = element_blank(),
+          axis.line  = element_line(color = "black"),
+          axis.ticks = element_line(color = "black"),
+          axis.title = element_text(color = "black"),
+          axis.text  = element_text(color = "black")
+        )
+      ggsave(
+        filename = paste0(s, "_", var, ".png"),
+        plot     = p,
+        path     = fig_by_sex,
+        width    = 5.5,
+        height   = 4,
+        dpi      = 900
+      )
+    }
+  }
+  p_all <- ggplot(df_var, pt_map) +
+    geom_point(size = 2, stroke = 0.5, alpha = 0.28) +
+    scale_shape_manual(values = c(f = 21, m = 22)) +
+    scale_fill_manual(values = sex_colors) +
+    scale_color_manual(values = sex_colors) +
+    geom_ribbon(data = plot_c,
+                aes(x = predictor, ymin = lower, ymax = upper),
+                inherit.aes = FALSE, fill = "black", alpha = 0.1) +
+    geom_line(data = plot_c,
+              aes(x = predictor, y = fit),
+              inherit.aes = FALSE, color = "black", size = 1) +
+    scale_x_continuous(expand = expansion(mult = c(0, 0.05)),
+                       limits = c(0, NA),
+                       breaks = pretty_breaks(n = 5),
+                       minor_breaks = pretty_breaks(n = 10)) +
+    scale_y_continuous(limits = c(0, 1),
+                       breaks = seq(0, 1, 0.2),
+                       minor_breaks = seq(0, 1, 0.1)) +
+    labs(title = paste("Severity vs", var), x = var, y = "Severity") +
+    theme_minimal(base_size = 18, base_family = "Arial") +
+    theme(
+      text       = element_text(face = "bold"),
+      panel.grid = element_blank(),
+      axis.line  = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      axis.title = element_text(color = "black"),
+      axis.text  = element_text(color = "black")
+    )
+  ggsave(
+    filename = paste0("combined_", var, ".png"),
+    plot     = p_all,
+    path     = fig_combined,
+    width    = 5.5,
+    height   = 4,
+    dpi      = 900
+  )
+}
+```
+
+### Phenotype by genotype variables
+
+#### Categorical genotype variables
+
+**Generation of Supplemental Table:**
+
+We compute for each binary symptom its prevalence (%) and 95% Wilson confidence interval overall and within each genotype level (retaining only levels with ≥5 individuals). We then construct a 2×k contingency table per symptom and genotype variable. When k=2, we apply Boschloo's test. When k\>2, we use Pearson's χ² (without Yates correction) falling back to Fisher-Freeman-Halton when any expected frequency is \<5. We adjust global p-values using the Benjamini-Hochberg method. Only factors with global q\<0.1 undergo post-hoc pairwise tests (Boschloo). Again, p-values are corrected using the Benjamini-Hochberg method.
+
+```{r build-prevalence-and-posthoc-tables-by-group, message=FALSE, warning=FALSE}
+library(dplyr)
+library(readr)
+library(tidyr)
+library(purrr)
+library(binom)
+library(exact2x2)
+
+# Wilson CI for a binary vector
+compute_prevalence_stats <- function(x) {
+  n_obs <- sum(!is.na(x))
+  n_aff <- sum(x == 1, na.rm=TRUE)
+  if(n_obs == 0) return(list(ratio="0/0", prev=NA, ci="NA", n=0))
+  ratio <- paste0(n_aff, "/", n_obs)
+  prev  <- round(100 * n_aff / n_obs, 1)
+  bt    <- binom.confint(n_aff, n_obs, methods="wilson")
+  ci    <- paste0(round(100 * bt$lower,1), "-", round(100 * bt$upper,1))
+  list(ratio=ratio, prev=prev, ci=ci, n=n_obs)
+}
+
+build_prevalence_and_posthoc_tables_by_group <- function(group_var, output_folder) {
+  # 1) load symptom list & names
+  var_cat  <- read_csv("variable_categorization_with_additional_info.csv", show_col_types=FALSE)
+  symptoms <- var_cat %>% filter(Measure=="Prevalence") %>% pull(Variable)
+  name_map <- setNames(var_cat$Clean_Name, var_cat$Variable)
+  
+  # 2) valid genotype levels with ≥5 subjects
+  counts    <- table(results_df[[group_var]])
+  valid_lvls <- names(counts[counts >= 5])
+  if(length(valid_lvls) < 2) stop("Not enough levels for ", group_var)
+  
+  overall_list <- list()
+  posthoc_list <- list()
+  
+  for(symp in symptoms) {
+    # 3) build contingency table
+    x_all <- results_df[[symp]]
+    ct <- sapply(valid_lvls, function(lvl) {
+      xi <- x_all[results_df[[group_var]]==lvl]
+      c(sum(xi==0,na.rm=TRUE), sum(xi==1,na.rm=TRUE))
+    })
+    ct <- matrix(ct, nrow=2, byrow=FALSE,
+                 dimnames=list(c("Absent","Present"), valid_lvls))
+    
+    # 4) global test
+    p_glob <- NA; test_glob <- "Insufficient data"; min_exp <- NA
+    if(sum(ct)>0) {
+      if(ncol(ct)==2) {
+        a1<-ct["Present",1]; n1<-sum(ct[,1])
+        a2<-ct["Present",2]; n2<-sum(ct[,2])
+        res <- exact2x2::boschloo(a1,n1,a2,n2)
+        test_glob <- "Boschloo"; p_glob <- res$p.value
+      } else {
+        ch <- suppressWarnings(chisq.test(ct, correct=FALSE))
+        min_exp <- min(ch$expected)
+        if(min_exp >= 5) {
+          test_glob <- "Chi-square"; p_glob <- ch$p.value
+        } else if(all(rowSums(ct)>0) && all(colSums(ct)>0)) {
+          fr <- fisher.test(ct)
+          test_glob <- "Fisher–Freeman–Halton"; p_glob <- fr$p.value
+        }
+      }
+    }
+    q_glob <- if(!is.na(p_glob)) p.adjust(p_glob, method="BH") else NA_real_
+    
+    # 5) per-level prevalence + CI
+    lvl_stats <- map(valid_lvls, function(lvl) {
+      st <- compute_prevalence_stats(x_all[results_df[[group_var]]==lvl])
+      c(Ratio=st$ratio, Prev=st$prev, CI=st$ci, N=st$n)
+    }) %>% unlist()
+    col_nms <- unlist(map(valid_lvls, ~ paste0(.x, c("_Ratio","_Prev","_CI","_N"))))
+    names(lvl_stats) <- col_nms
+    
+    # 6) post-hoc if global q<0.1
+    posthoc_summary <- NA_character_
+    if(!is.na(q_glob) && q_glob < 0.1) {
+      pairs <- combn(valid_lvls,2, simplify=FALSE)
+      ph <- map_dfr(pairs, function(pr) {
+        l1<-pr[1]; l2<-pr[2]
+        a1<-ct["Present",l1]; n1<-sum(ct[,l1])
+        a2<-ct["Present",l2]; n2<-sum(ct[,l2])
+        r2 <- exact2x2::boschloo(a1,n1,a2,n2)
+        tibble(
+          Symptom      = name_map[[symp]] %||% symp,
+          Pair         = paste(l1,"vs",l2),
+          Pair_Test    = "Boschloo",
+          Pair_p.value = r2$p.value
+        )
+      }) %>% mutate(pairwise_q = p.adjust(Pair_p.value, "BH"))
+      posthoc_summary <- paste(
+        sprintf("%s: p=%.3g,q=%.3g", ph$Pair, ph$Pair_p.value, ph$pairwise_q),
+        collapse=" | "
+      )
+      posthoc_list[[symp]] <- ph
+    }
+    
+    overall_list[[symp]] <- tibble(
+      Symptom         = name_map[[symp]] %||% symp,
+      !!!as.list(lvl_stats),
+      TestUsed        = test_glob,
+      p.value         = p_glob,
+      min.expected    = min_exp,
+      q.value         = q_glob,
+      PostHoc_Summary = posthoc_summary
+    )
+  }
+  
+  overall_df <- bind_rows(overall_list)
+  posthoc_df  <- bind_rows(posthoc_list)
+  
+  dir.create(output_folder, recursive=TRUE, showWarnings=FALSE)
+  write_csv(overall_df, file.path(output_folder, paste0("prevalence_by_",group_var,".csv")))
+  write_csv(posthoc_df,  file.path(output_folder, paste0("posthoc_by_",   group_var,".csv")))
+  message("Done: ", group_var)
+}
+
+# run over all categorical genotype vars
+group_vars <- c(
+  "Mutation_Type",
+  "Domain_Location_Of_Variant",
+  "Lost_Functional_Domains",
+  "Lost_Functional_Domains_in_protein_from_non_canonical_in_frame_TIS",
+  "1996dupC",
+  "lost_signals"
+)
+output_folder <- "output/tables/prevalence_by_genotype"
+
+purrr::walk(group_vars,
+            ~ build_prevalence_and_posthoc_tables_by_group(.x, output_folder)
+)
+```
+
+**Generation of genotype-variable-specific Radar Charts:**
+
+```{r radar-charts-for-categorical-genotype-variables, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggradar)
+library(scales)
+library(ggplot2)
+library(readr)
+library(openxlsx)
+
+include_vars <- c("hypotonia", "GERD", "respiratory distress", 
+                  "contractures", "scoliosis", "short extremities")
+
+group_vars <- c("Mutation_Type", 
+                "Domain_Location_Of_Variant", 
+                "Lost_Functional_Domains", 
+                "Lost_Functional_Domains_in_protein_from_non_canonical_in_frame_TIS", 
+                "1996dupC", 
+                "lost_signals")
+
+# Paths
+input_folder <- file.path(tables_dir, "symptom prevalence for categorical genotype variables")
+plots_folder <- plots_dir
+if (!dir.exists(plots_folder)) dir.create(plots_folder, recursive = TRUE)
+
+# Colors
+group_colors <- c("#E69F00", "#56B4E9", "#009E73", "#CC79A7", "#BCB334")
+
+for (group in group_vars) {
+  
+  # Read prevalence table
+  overall_file <- file.path(input_folder, paste0("prevalence_by_", group, ".csv"))
+  overall_df   <- read_csv(overall_file, show_col_types = TRUE)
+  
+  # Filter symptoms
+  radar_df <- overall_df %>% 
+    filter(Symptom %in% include_vars)
+  
+  # Find prevalence columns
+  prevalence_cols <- grep("_Prevalence$", colnames(radar_df), value = TRUE)
+  
+  # Long format
+  radar_long <- radar_df %>%
+    dplyr::select(Symptom, all_of(prevalence_cols)) %>%
+    pivot_longer(
+      cols      = -Symptom,
+      names_to  = "Group",
+      values_to = "Prevalence"
+    ) %>%
+    mutate(
+      Group = gsub("_Prevalence", "", Group),
+      Group = gsub("_", " ", Group)
+    )
+  
+  # Wide format + scale & replace NAs only in numeric columns
+  radar_wide <- radar_long %>%
+    pivot_wider(names_from = Symptom, values_from = Prevalence) %>%
+    mutate(Group = as.factor(Group)) %>%
+    dplyr::select(Group, all_of(include_vars)) %>%
+    mutate(across(-Group, ~ replace_na(.x / 100, 0)))
+  
+  # Axis labels
+  symptom_labels <- include_vars
+  symptom_labels[symptom_labels == "respiratory distress"] <- "respiratory\ndistress"
+  symptom_labels[symptom_labels == "short extremities"]   <- "short\nextremities"
+  colnames(radar_wide)[-1] <- symptom_labels
+  
+  # Reorder levels
+  if (group == "Domain_Location_Of_Variant") {
+    radar_wide$Group <- factor(radar_wide$Group,
+      levels = c("proline rich", "u7bs", "mhd")
+    )
+  }
+  if (group == "Lost_Functional_Domains") {
+    radar_wide$Group <- factor(radar_wide$Group,
+      levels = c(
+        "proline rich", 
+        "proline rich, u7bs, mhd",
+        "u7bs",
+        "u7bs, mhd",
+        "mhd"
+      )
+    )
+  }
+  if (group == "Mutation_Type") {
+    radar_wide$Group <- factor(radar_wide$Group,
+      levels = c(
+        "Frameshifting indel", 
+        "Nonsense",
+        "Missense"
+      )
+    )
+  }
+  
+  # Colors
+  used_colors <- group_colors[ seq_along(unique(radar_wide$Group)) ]
+  
+  # Build radar chart
+  p <- ggradar(
+    radar_wide,
+    grid.min                      = 0,
+    grid.mid                      = 0.5,
+    grid.max                      = 1,
+    grid.label.size               = 3,
+    values.radar                  = c("", "", ""),
+    axis.label.size               = 2,
+    axis.label.offset             = 1.15,
+    plot.legend                   = TRUE,
+    plot.extent.x.sf              = 1.3,
+    plot.extent.y.sf              = 1.3,
+    gridline.min.linetype         = "dashed",
+    gridline.mid.linetype         = "dashed",
+    gridline.max.linetype         = "dashed",
+    gridline.min.colour           = "grey70",
+    gridline.mid.colour           = "grey70",
+    gridline.max.colour           = "grey70",
+    background.circle.colour      = "grey90",
+    background.circle.transparency = 0.2,
+    group.colours                 = used_colors,
+    fill                          = TRUE,
+    fill.alpha                    = 0.1,
+    group.point.size              = 0
+  ) +
+    scale_fill_manual(values = used_colors) +
+    scale_color_manual(values = used_colors) +
+    guides(
+      fill  = guide_legend(title = "", ncol = 1),
+      color = guide_legend(title = "", ncol = 1)
+    ) +
+    theme(
+      legend.text   = element_text(size = 5, face = "bold", family = "Arial"),
+      axis.text     = element_text(size = 5,  face = "bold", family = "Arial"),
+      legend.position      = c(-0.5, 0),
+      legend.justification = c(0, 0),
+      plot.margin          = margin(t = 10, r = 30, b = 10, l = 30, unit = "pt")
+    )
+  
+  # Save
+  output_file <- file.path(plots_folder, paste0("radar_plot_", group, ".png"))
+  ggsave(output_file, p, width = 10, height = 3, dpi = 300)
+  cat("Radar plot for", group, "saved to:", output_file, "\n")
+  print(p)
+}
+```
+
+#### Continuous genotype variables
+
+**Logistic regression**
+
+Given that only Protein length was significantly associated with severity, we use only protein length as a predictor and focus on those symptoms that are part of the SYS severity score. We include symptoms with ≥10 individual cases and both sexes. We fit logistic models using glm(..., family=binomial) to regress each symptom on protein length, sex, and their interaction. We compute performance (AUC, Brier). We call emmeans::emtrends() to estimate sex-specific and marginal slopes and CIs. We use the Benjamini-Hochberg method within each Term to calculate q values. We exponentiate the marginal log-odds slope to yield ORs per aa and per 100aa.
+
+```{r logistic-severity-emmeans-eval, message=FALSE, warning=FALSE}
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(broom)
+library(emmeans)
+library(pROC)
+library(readr)
+
+# norm function
+norm_ci <- function(tb) {
+  tb <- as_tibble(tb)
+  if (!"lower.CL" %in% names(tb) && "asymp.LCL" %in% names(tb)) tb$lower.CL <- tb$asymp.LCL
+  if (!"upper.CL" %in% names(tb) && "asymp.UCL" %in% names(tb)) tb$upper.CL <- tb$asymp.UCL
+  tb
+}
+
+# 1) Setup
+var_cat <- read_csv(file.path(data_dir, "variable_categorization_with_additional_info.csv"))
+severity_symptoms <- var_cat %>%
+  filter(Measure == "Prevalence", part_severity_score == "yes") %>%
+  pull(Variable)
+predictor   <- "Protein_Length_[aa]"
+out_dir_int <- file.path(base_out, "logistic regression severity symptoms by Protein Length interaction model")
+dir.create(out_dir_int, recursive = TRUE, showWarnings = FALSE)
+
+# 2) Fit & gather
+logistic_res <- severity_symptoms %>%
+  set_names() %>%
+  map_dfr(function(symptom) {
+    df <- results_df %>%
+      select(y = all_of(symptom), x = all_of(predictor), sex) %>%
+      drop_na() %>%
+      mutate(sex = factor(sex, levels = c("f","m")))  
+
+    N0 <- sum(df$y == 0); N1 <- sum(df$y == 1); Nsex <- n_distinct(df$sex)
+    if (N0 < 10 || N1 < 10 || Nsex < 2) {
+      return(tibble(
+        Symptom = symptom, N0 = N0, N1 = N1, Nsex = Nsex,
+        Term = c("FemSlope","MaleSlope","MarginalSlope","Interaction"),
+        Estimate = NA_real_, SE = NA_real_, df = NA_real_,
+        lower.CL = NA_real_, upper.CL = NA_real_,
+        p.value = NA_real_, q.value = NA_real_,
+        AUC = NA_real_, Brier = NA_real_
+      ))
+    }
+
+    fit     <- glm(y ~ x * sex, data = df, family = binomial)
+    phat    <- predict(fit, type = "response")
+    auc_val <- as.numeric(roc(df$y, phat)$auc)
+    brier   <- mean((phat - df$y)^2)
+
+    # sex-specific slopes 
+    et  <- emtrends(fit, ~ sex, var = "x")
+    thr <- summary(et, infer = c(TRUE, TRUE)) %>%
+      norm_ci() %>%
+      rename(trend = x.trend)
+
+    fem <- thr %>% filter(sex == "f")
+    mal <- thr %>% filter(sex == "m")
+
+    # marginal slope
+    emm <- emtrends(fit, ~ 1, var = "x")
+    mar <- summary(emm, infer = c(TRUE, TRUE)) %>%
+      norm_ci() %>%
+      rename(trend = x.trend)
+
+    # interaction term
+    it <- tidy(fit, conf.int = TRUE) %>%
+      filter(grepl("x:sexm|sexm:x", term)) %>%
+      transmute(
+        Term     = "Interaction",
+        Estimate = estimate,
+        SE       = std.error,
+        df       = NA_real_,
+        lower.CL = conf.low,
+        upper.CL = conf.high,
+        p.value  = p.value
+      )
+
+    bind_rows(
+      tibble(
+        Symptom = symptom, N0 = N0, N1 = N1, Nsex = Nsex, Term = "FemSlope",
+        Estimate = fem$trend, SE = fem$SE, df = fem$df,
+        lower.CL = fem$lower.CL, upper.CL = fem$upper.CL,
+        p.value = fem$p.value
+      ),
+      tibble(
+        Symptom = symptom, N0 = N0, N1 = N1, Nsex = Nsex, Term = "MaleSlope",
+        Estimate = mal$trend, SE = mal$SE, df = mal$df,
+        lower.CL = mal$lower.CL, upper.CL = mal$upper.CL,
+        p.value = mal$p.value
+      ),
+      tibble(
+        Symptom = symptom, N0 = N0, N1 = N1, Nsex = Nsex, Term = "MarginalSlope",
+        Estimate = mar$trend, SE = mar$SE, df = mar$df,
+        lower.CL = mar$lower.CL, upper.CL = mar$upper.CL,
+        p.value = mar$p.value
+      ),
+      it %>% mutate(Symptom = symptom, N0 = N0, N1 = N1, Nsex = Nsex)
+    ) %>% mutate(AUC = auc_val, Brier = brier)
+  })
+
+# 3) BH correction within Term
+logistic_res <- logistic_res %>%
+  group_by(Term) %>%
+  mutate(q.value = p.adjust(p.value, method = "BH")) %>%
+  ungroup()
+
+# 4) Pivot & compute ORs (per-aa and per-100-aa) for marginal slope
+logit_tbl <- logistic_res %>%
+  pivot_wider(
+    id_cols    = c(Symptom, N0, N1, Nsex, AUC, Brier),
+    names_from = Term,
+    values_from= c(Estimate, SE, lower.CL, upper.CL, p.value, q.value),
+    names_glue = "{Term}_{.value}"
+  ) %>%
+  mutate(
+    OR_Marginal      = exp(MarginalSlope_Estimate),
+    OR_Marginal_L95  = exp(MarginalSlope_lower.CL),
+    OR_Marginal_U95  = exp(MarginalSlope_upper.CL),
+    OR100_Marginal   = exp(MarginalSlope_Estimate * 100),
+    OR100_Marg_L95   = exp((MarginalSlope_Estimate - 1.96 * MarginalSlope_SE) * 100),
+    OR100_Marg_U95   = exp((MarginalSlope_Estimate + 1.96 * MarginalSlope_SE) * 100)
+  ) %>%
+  select(
+    Symptom, N0, N1, Nsex, AUC, Brier,
+    starts_with("FemSlope_"),
+    starts_with("MaleSlope_"),
+    starts_with("MarginalSlope_"),
+    starts_with("OR_Marginal"),
+    starts_with("OR100_Marg"),
+    starts_with("Interaction_")
+  )
+
+# 5) Save
+write_csv(logit_tbl, file.path(out_dir_int, "logistic_interaction_summary.csv"))
+```
+
+Plots of marginal slopes (given that we found no significant interactions):
+
+```{r logistic-symptom-plots, message=FALSE, warning=FALSE}
+
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+sex_colors   <- c(f = "#D81B60", m = "#1E88E5")
+
+
+# directory
+fig_logistic <- file.path(out_dir_int, "figures", "by_symptom")
+dir.create(fig_logistic, recursive = TRUE, showWarnings = FALSE)
+
+# Loop over symptoms
+for (symptom in severity_symptoms) {
+  df <- results_df %>%
+    select(x = all_of(predictor), y = all_of(symptom), sex) %>%
+    rename(predictor = x) %>%
+    drop_na()
+
+  # Skip if insufficient variation
+  if (n_distinct(df$y) < 2 || nrow(df) < 10) next
+
+  # plot
+  p <- ggplot(df, aes(x = predictor, y = y)) +
+    geom_point(
+      aes(shape = sex, fill = sex, color = sex),
+      size   = 2,
+      stroke = 0.5,
+      alpha  = 0.28
+    ) +
+    scale_shape_manual(values = c(f = 21, m = 22), labels = c("Female","Male"), name = "Sex") +
+    scale_fill_manual(values = sex_colors, guide = FALSE) +
+    scale_color_manual(values = sex_colors, guide = FALSE) +
+    stat_smooth(
+      method      = "glm",
+      method.args = list(family = binomial),
+      se          = TRUE,
+      color       = "black",
+      fill        = "grey80",
+      size        = 1
+    ) +
+    scale_x_continuous(
+      expand       = expansion(mult = c(0, 0.05)),
+      limits       = c(0, NA),
+      breaks       = pretty_breaks(n = 5),
+      minor_breaks = pretty_breaks(n = 10)
+    ) +
+    scale_y_continuous(
+      limits       = c(0, 1),
+      breaks       = seq(0, 1, by = 0.2),
+      minor_breaks = seq(0, 1, by = 0.1),
+      labels       = percent_format(accuracy = 1)
+    ) +
+    labs(
+      title = paste0(symptom, " – Pr(symptom=1) vs Protein Length"),
+      x     = predictor,
+      y     = "Probability (%)"
+    ) +
+    theme_minimal(base_size = 18, base_family = "Arial") +
+    theme(
+      text         = element_text(face = "bold"),
+      plot.title   = element_text(size = 16, color = "black"),
+      axis.title   = element_text(color = "black"),
+      axis.text    = element_text(color = "black"),
+      panel.grid   = element_blank(),
+      axis.line    = element_line(color = "black"),
+      axis.ticks   = element_line(color = "black"),
+      legend.position = "none"
+    )
+
+  # save
+  ggsave(
+    filename = paste0("logistic_", symptom, ".png"),
+    plot     = p,
+    path      = fig_logistic,
+    width     = 6,
+    height    = 3,
+    dpi       = 300
+  )
+}
+```
+
+Forestplot:
+
+```{r forestplot-ProteinLength-100aa, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+# 1) Build forest_df from logit_tbl
+forest_df <- logit_tbl %>%
+  transmute(
+    Symptom = Symptom,
+    OR100    = OR100_Marginal,
+    CI_lo    = OR100_Marg_L95,
+    CI_hi    = OR100_Marg_U95,
+    p.value  = MarginalSlope_p.value,
+    q.value  = MarginalSlope_q.value,
+    sig      = p.value < 0.05,
+    Symptom  = if_else(sig, paste0(Symptom, " *"), Symptom),
+    ORlabel  = sprintf("%.2f [%.2f, %.2f]", OR100, CI_lo, CI_hi),
+    pqlabel  = sprintf("p=%.3f\nq=%.3f", p.value, q.value)
+  ) %>%
+  arrange(OR100) %>%
+  mutate(Symptom = fct_rev(fct_inorder(Symptom)))
+
+# 2) x‐axis limits
+xr    <- range(forest_df$CI_lo, forest_df$CI_hi, na.rm = TRUE)
+pad   <- diff(xr) * 0.15
+xlims <- xr + c(-pad, pad)
+
+# 3) Draw forest plot
+p_forest_new <- ggplot(forest_df, aes(x = OR100, y = Symptom)) +
+  geom_errorbarh(aes(xmin = CI_lo, xmax = CI_hi),
+                 height = 0.3, color = "grey40") +
+  geom_point(aes(fill = sig), shape = 21, size = 3) +
+  scale_fill_manual(values = c("white", "black"), guide = FALSE) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey60") +
+  geom_text(aes(label = ORlabel),
+            x = xlims[2] + 0.02 * diff(xlims),
+            hjust = 0, size = 3) +
+  geom_text(aes(label = pqlabel),
+            x = xlims[2] + 0.18 * diff(xlims),
+            hjust = 0, size = 3) +
+  scale_x_continuous(limits = xlims,
+                     breaks = scales::pretty_breaks(5)) +
+  labs(
+    title = "Effect of Protein Length on Symptom Odds (per 100 aa)",
+    x     = "Odds Ratio (per 100 aa)",
+    y     = NULL
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.ticks.y = element_blank(),
+    axis.line.y  = element_blank(),
+    axis.text.y  = element_text(size = 10),
+    axis.text.x  = element_text(size = 10),
+    plot.margin  = margin(5, 80, 5, 5)
+  )
+
+# 4) Save
+fig_dir <- file.path(out_dir_int, "figures")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+ggsave(
+  filename = "forest_ProteinLength_100aa_new.png",
+  plot     = p_forest_new,
+  path     = fig_dir,
+  width    = 8,
+  height   = 0.25 * nrow(forest_df)+1,
+  dpi      = 300
+)
+```
+
+Standard Diagnostics:
+
+```{r logistic-diagnostics, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(scales)
+library(purrr)
+
+predictor <- "Protein_Length_[aa]"
+
+# guards & dirs
+stopifnot(predictor %in% names(results_df))
+diag_dir <- file.path(out_dir_int, "diagnostics")
+dir.create(diag_dir, recursive = TRUE, showWarnings = FALSE)
+glm_diag_dir <- file.path(diag_dir, "per_symptom_glm_diagnostics")
+dir.create(glm_diag_dir, recursive = TRUE, showWarnings = FALSE)
+
+# symptoms to evaluate
+severity_symptoms <- var_cat %>%
+  filter(Measure == "Prevalence", part_severity_score == "yes") %>%
+  pull(Variable)
+
+symptoms_exist <- severity_symptoms[severity_symptoms %in% names(results_df)]
+if (length(symptoms_exist) == 0) stop("No severity-score symptoms found in results_df.")
+
+# inclusion check per symptom
+incl_tbl <- map_dfr(symptoms_exist, function(symp) {
+  df <- results_df %>%
+    select(y = all_of(symp), x = all_of(predictor), sex) %>%
+    drop_na() %>%
+    mutate(sex = factor(sex, levels = c("f","m")))
+
+  tibble(
+    Symptom = symp,
+    N       = nrow(df),
+    N0      = sum(df$y == 0, na.rm = TRUE),
+    N1      = sum(df$y == 1, na.rm = TRUE),
+    Nsex    = dplyr::n_distinct(df$sex),
+    keep    = (N0 >= 10 & N1 >= 10 & Nsex == 2)
+  )
+})
+
+# save skip summary
+readr::write_csv(incl_tbl, file.path(diag_dir, "skip_summary.csv"))
+
+included_syms <- incl_tbl %>% filter(keep) %>% pull(Symptom)
+skipped_syms  <- incl_tbl %>% filter(!keep) %>% pull(Symptom)
+
+# linearity-in-logit plot
+if (length(included_syms) > 0) {
+  diag_df <- results_df %>%
+    select(all_of(c(predictor, included_syms))) %>%
+    pivot_longer(cols = all_of(included_syms),
+                 names_to = "Symptom", values_to = "y") %>%
+    mutate(y = as.integer(y)) %>%
+    drop_na()
+
+  p <- ggplot(diag_df, aes(x = .data[[predictor]], y = y)) +
+    geom_point(alpha = 0.15, size = 1, shape = 16) +
+    geom_smooth(method = "glm", method.args = list(family = binomial), se = TRUE) +
+    facet_wrap(~ Symptom, scales = "free_x") +
+    scale_y_continuous("Symptom prevalence probability",
+                       limits = c(0, 1),
+                       labels = label_percent(accuracy = 1)) +
+    labs(
+      x     = predictor,
+      title = "Linearity-in-logit check (GLM fit shown on probability scale)"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      axis.title = element_text(color = "black"),
+      axis.text  = element_text(color = "black"),
+      strip.text = element_text(face = "bold")
+    )
+
+  ggsave(
+    filename = file.path(diag_dir, "linearity-in-logit-plots.png"),
+    plot     = p,
+    width    = 12, height = 8, units = "in", dpi = 300
+  )
+}
+
+# per-symptom GLM diagnostic panels
+walk(included_syms, function(symp) {
+  df <- results_df %>%
+    select(y = all_of(symp), x = all_of(predictor), sex) %>%
+    drop_na() %>%
+    mutate(sex = factor(sex, levels = c("f","m")))
+
+  fit <- glm(y ~ x * sex, data = df, family = binomial)
+
+  png(
+    filename = file.path(glm_diag_dir, paste0(symp, "_glm_diagnostics.png")),
+    width = 10, height = 10, units = "in", res = 300, type = "cairo"
+  )
+  par(mfrow = c(2, 2), oma = c(0, 0, 3, 0), mar = c(5, 4, 2, 1))
+  plot(fit, which = 1, main = "Residuals vs Fitted", caption = "", sub.caption = "", ask = FALSE)
+  plot(fit, which = 2, main = "Normal Q–Q (Std. deviance residuals)", caption = "", sub.caption = "", ask = FALSE)
+  plot(fit, which = 4, main = "Cook's Distance", caption = "", sub.caption = "", ask = FALSE)
+  plot(fit, which = 5, main = "Residuals vs Leverage (Cook's contours)", caption = "", sub.caption = "", ask = FALSE)
+  mtext(paste("Logistic diagnostics for:", symp), side = 3, outer = TRUE, line = 1.2, font = 2, cex = 1.1)
+  dev.off()
+})
+
+# summary
+message("Diagnostics — included: ", length(included_syms),
+        " | skipped: ", length(skipped_syms),
+        " (see skip_summary.csv for details)")
+
+```
+
+### gnomAD versus SYS individuals
+
+```{r write_gnomad_vs_patients_excel, echo=TRUE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(readr)
+library(tidyr)
+library(purrr)
+library(writexl)
+
+gnomad_dir <- file.path(data_dir, "gnomAD comparison")
+
+# 1) Load MAP results for gnomAD population
+gnomad <- read_csv(
+  file.path(data_dir, "MAP_results_gnomAD_without_UTRs.csv"),
+  show_col_types = FALSE
+) %>%
+  rename(
+    Mutation_Type              = `Mutation Type`,
+    Domain_Location_Of_Variant = `Domain Location Of Variant`,
+    Lost_Functional_Domains    = `Lost Functional Domains`,
+    lost_signals               = `Lost Motifs`,
+    `Protein_Length_[aa]`      = `Protein Length aa`
+  )
+
+# 2) Ensure patient df has Protein Length column
+if (!"Protein_Length_[aa]" %in% names(results_df)) {
+  stop("Patient data.frame needs a column called Protein_Length_[aa]")
+}
+
+# 3) filtering
+clinvar_keep <- c(
+  "Uncertain significance",
+  "Benign",
+  "Likely benign",
+  "Benign/Likely benign"
+)
+exclude_types <- c("Silent", "Missense", "In-Frame indel")
+
+# 4) Build four subsets
+gnomad_orig   <- gnomad %>% filter(ClinVar.Germline.Classification %in% clinvar_keep)
+gnomad_filt   <- gnomad_orig %>% filter(!Mutation_Type %in% exclude_types)
+
+patients_orig <- results_df
+patients_filt <- patients_orig %>% filter(!Mutation_Type %in% exclude_types)
+
+# 5) Variables to summarise
+cat_vars <- c(
+  "Mutation_Type",
+  "Domain_Location_Of_Variant",
+  "Lost_Functional_Domains",
+  "lost_signals"
+)
+cont_var <- "Protein_Length_[aa]"
+
+# 6) Summaries
+summ_cat <- function(df, var) {
+  df %>%
+    mutate(!!sym(var) := replace_na(.data[[var]], "none")) %>%
+    count(Category = .data[[var]], name = "Count") %>%
+    mutate(Percent = round(Count / sum(Count) * 100, 1))
+}
+
+summ_cont <- function(df, var) {
+  x <- df[[var]]
+  tibble(
+    Metric = c("n", "Mean", "SD", "Median", "IQR", "Min", "Max"),
+    Value  = c(
+      sum(!is.na(x)),
+      mean(x,    na.rm = TRUE),
+      sd(x,      na.rm = TRUE),
+      median(x,  na.rm = TRUE),
+      stats::IQR(x,     na.rm = TRUE),   
+      min(x,     na.rm = TRUE),
+      max(x,     na.rm = TRUE)
+    )
+  )
+}
+
+# 7) Build sheet list
+sheets <- list()
+
+# 7a) categorical sheets
+for (v in cat_vars) {
+  g_o <- summ_cat(gnomad_orig,   v) %>% rename_with(~paste0("Gnomad_Orig_", .), c("Count","Percent"))
+  g_f <- summ_cat(gnomad_filt,   v) %>% rename_with(~paste0("Gnomad_Filt_", .), c("Count","Percent"))
+  p_o <- summ_cat(patients_orig, v) %>% rename_with(~paste0("Patient_Orig_", .), c("Count","Percent"))
+  p_f <- summ_cat(patients_filt, v) %>% rename_with(~paste0("Patient_Filt_", .), c("Count","Percent"))
+  
+  cat_df <- list(g_o, g_f, p_o, p_f) %>%
+    reduce(full_join, by = "Category") %>%
+    arrange(desc(if_any(starts_with("Gnomad_Orig_Count"), ~ . > 0)))
+  
+  sheets[[paste0(v, "_categorical")]] <- cat_df
+}
+
+# 7b) continuous sheet
+c_go <- summ_cont(gnomad_orig,   cont_var) %>% rename(Gnomad_Orig  = Value)
+c_gf <- summ_cont(gnomad_filt,   cont_var) %>% rename(Gnomad_Filt  = Value)
+c_po <- summ_cont(patients_orig, cont_var) %>% rename(Patient_Orig = Value)
+c_pf <- summ_cont(patients_filt, cont_var) %>% rename(Patient_Filt = Value)
+
+sheets[["Protein_Length_continuous"]] <-
+  list(c_go, c_gf, c_po, c_pf) %>%
+  reduce(full_join, by = "Metric")
+
+# 8) Write Excel
+out_file <- file.path(tables_dir, "gnomad_vs_results_comparison.xlsx")
+write_xlsx(sheets, path = out_file)
+message("✔ Written: ", out_file)
+```
+
+### Lethal versus non-lethal cases
+
+```{r write_lethality_comparison, echo=TRUE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(writexl)
+
+# ensure death is 0/1 and drop NAs
+patients <- results_df %>%
+  mutate(death = as.integer(death)) %>%
+  filter(death %in% c(0,1))
+
+nonlethal <- patients %>% filter(death == 0)
+lethal    <- patients %>% filter(death == 1)
+
+# variables to summarise
+cat_vars <- c(
+  "Mutation_Type",
+  "Domain_Location_Of_Variant",
+  "Lost_Functional_Domains",
+  "lost_signals"
+)
+cont_var <- "Protein_Length_[aa]"
+
+# helpers
+summ_cat <- function(df, var) {
+  df %>%
+    mutate(!!sym(var) := replace_na(.data[[var]], "none")) %>%
+    count(Category = .data[[var]], name = "Count") %>%
+    mutate(Percent = round(Count / sum(Count) * 100, 1))
+}
+
+summ_cont <- function(df, var) {
+  x <- df[[var]]
+  tibble(
+    Metric = c("n", "Mean", "SD", "Median", "IQR", "Min", "Max"),
+    Value  = c(
+      sum(!is.na(x)),
+      mean(x,    na.rm = TRUE),
+      sd(x,      na.rm = TRUE),
+      median(x,  na.rm = TRUE),
+      IQR(x,     na.rm = TRUE),
+      min(x,     na.rm = TRUE),
+      max(x,     na.rm = TRUE)
+    )
+  )
+}
+
+# build sheets list
+sheets_leth <- list()
+
+# categorical
+for (v in cat_vars) {
+  nl <- summ_cat(nonlethal, v) %>%
+    rename(NonLethal_Count   = Count,
+           NonLethal_Percent = Percent)
+  lt <- summ_cat(lethal,    v) %>%
+    rename(Lethal_Count      = Count,
+           Lethal_Percent    = Percent)
+  df_join <- full_join(nl, lt, by = "Category") %>%
+    arrange(desc(replace_na(NonLethal_Count, 0)))
+  sheets_leth[[paste0(v, "_lethality_categorical")]] <- df_join
+}
+
+# continuous
+c_nl <- summ_cont(nonlethal, cont_var) %>%
+  rename(NonLethal = Value)
+c_lt <- summ_cont(lethal,    cont_var) %>%
+  rename(Lethal    = Value)
+
+sheets_leth[["Protein_Length_lethality_continuous"]] <-
+  list(c_nl, c_lt) %>%
+  reduce(full_join, by = "Metric")
+
+# 5) write Excel 
+out_file <- file.path(tables_dir, "results_lethality_comparison.xlsx")
+write_xlsx(sheets_leth, path = out_file)
+message("✔ Written: ", out_file)
+```
+
+# Miscellaneous
+
+## Figure 1C: Target Plot
+
+```{r target-plot}
+library(tidyverse)
+library(ggforce)
+library(grid)
+
+# 1. Load data
+df <- results_df %>%
+  transmute(
+    patient_ID,
+    `motor delay`          = as.numeric(`DD_(motor_delay)`),
+    `delayed speech`       = as.numeric(`DD_(speech_delay)`),
+    ID                     = as.numeric(`ID_(any)`),
+    hypotonia              = as.numeric(muscular_hypotonia),
+    `feeding difficulties` = as.numeric(feeding_difficulties_except_hyperphagia),
+    hyperphagia            = as.numeric(hyperphagia),
+    overweight             = as.numeric(overweight_issues),
+    underweight            = as.numeric(underweight_issues),
+    `chronic constipation` = as.numeric(chronic_constipation),
+    GERD                   = as.numeric(GERD),
+    `sleep apnea`          = as.numeric(sleep_apnea),
+    `respiratory distress` = as.numeric(respiratory_distress),
+    contractures           = as.numeric(contractures_or_arthrogryposis),
+    scoliosis              = as.numeric(scoliosis_or_kyphosis),
+    epilepsy               = as.numeric(seizures_or_epilepsy),
+    `ocular issues`        = as.numeric(ocular_anomalies),
+    `genitourinary issues` = as.numeric(genitourinary_anomalies),
+    `GH deficiency`        = as.numeric(GH_deficiency),
+    `endocrine issues`     = as.numeric(`endocrine_or_metabolic_dysfunction_(any)`),
+    autism                 = as.numeric(autism),
+    anxiety                = as.numeric(anxiety),
+    `other behavioral issues` = as.numeric(temper_tantrums_or_impulsivity),
+    points_achieved        = rowSums(across(`motor delay`:`other behavioral issues`), na.rm = TRUE),
+    `max achievable points` = as.numeric(max_achievable_points),
+    severity_score          = as.numeric(severity)
+  )
+
+# 2. Pivot long + mark missing + compute S_part and S_score
+symptom_cols <- setdiff(names(df),
+                        c("patient_ID","points_achieved","max achievable points","severity_score"))
+long_A <- df %>%
+  pivot_longer(all_of(symptom_cols),
+               names_to  = "symptom",
+               values_to = "symptom_points") %>%
+  group_by(patient_ID) %>%
+  mutate(
+    missing        = is.na(symptom_points),
+    symptom_points = replace_na(symptom_points, 0),
+    total_pts      = sum(symptom_points),
+    S_part         = if_else(total_pts == 0, 0, symptom_points/total_pts * severity_score),
+    S_score        = severity_score
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(S_score))
+
+# 3. Keep only symptoms ever present
+present_syms <- long_A %>%
+  group_by(symptom) %>%
+  summarise(any_present = any(S_part > 0), .groups = "drop") %>%
+  filter(any_present) %>%
+  pull(symptom)
+long_A <- filter(long_A, symptom %in% present_syms)
+
+# 4. Geometry constants
+n_pat    <- n_distinct(long_A$patient_ID)
+symptoms <- rev(unique(long_A$symptom))
+n_sym    <- length(symptoms)
+max_S    <- max(long_A$S_score)
+inner_r  <- max_S * 0.10
+ring_thk <- (max_S * 0.80) / (n_sym + 1)
+outer_R  <- inner_r + (n_sym + 1) * ring_thk
+
+# 5. Label positions
+buffer   <- outer_R * 0.02
+labels_df <- tibble(symptom = symptoms, ridx = seq_along(symptoms)) %>%
+  mutate(
+    r_mid       = inner_r + (ridx - 0.5) * ring_thk,
+    col         = ridx %% 2,
+    x_line_end  = if_else(col == 0,
+                          outer_R * 1.05 - buffer,
+                          outer_R * 1.65 - buffer),
+    x_text      = if_else(col == 0,
+                          outer_R * 1.05,
+                          outer_R * 1.65),
+    y_line_end  = r_mid,
+    y_text      = r_mid,
+    hjust       = 0
+  )
+
+# -------------------------------------------------------------------
+# Plot A: sorted by ascending overall severity score
+# -------------------------------------------------------------------
+# 6A. Order patients by severity
+patient_order_sev <- long_A %>%
+  distinct(patient_ID, S_score) %>%
+  arrange(S_score, patient_ID) %>%
+  pull(patient_ID)
+
+long_sev <- long_A %>%
+  mutate(patient_ID = factor(patient_ID, levels = patient_order_sev))
+
+# 7A. Build ring & outer-ring data for severity order
+sym_df_sev <- long_sev %>%
+  group_by(patient_ID, symptom) %>%
+  summarise(
+    missing = missing[1],
+    S_part  = sum(S_part),
+    S_score = S_score[1],
+    .groups = "drop"
+  ) %>%
+  arrange(factor(symptom, levels = symptoms)) %>%
+  mutate(
+    ridx    = as.integer(factor(symptom, levels = symptoms)),
+    r0      = inner_r + (ridx - 1) * ring_thk,
+    r1      = inner_r + ridx     * ring_thk,
+    idx     = as.integer(patient_ID) - 1,
+    start   = 2 * pi * idx / n_pat,
+    end     = 2 * pi * (idx + 1) / n_pat,
+    present = S_part > 0
+  )
+outer_sev <- sym_df_sev %>%
+  distinct(patient_ID, S_score, .keep_all = TRUE) %>%
+  mutate(
+    r0 = inner_r + n_sym     * ring_thk,
+    r1 = inner_r + (n_sym+1) * ring_thk
+  )
+
+# 8A. Build severity‐ordered plot
+p_sev <- ggplot() +
+  geom_arc_bar(data = filter(sym_df_sev, missing),
+               aes(x0=0, y0=0, r0=r0, r=r1, start=start, end=end),
+               fill="grey80", colour=NA) +
+  geom_arc_bar(data = filter(sym_df_sev, present),
+               aes(x0=0, y0=0, r0=r0, r=r1, start=start, end=end),
+               fill="black", colour=NA) +
+  geom_arc_bar(data = sym_df_sev,
+               aes(x0=0, y0=0, r0=r0, r=r1, start=start, end=end),
+               fill=NA, colour="grey80", size=0.2) +
+  geom_arc_bar(data = outer_sev,
+               aes(x0=0, y0=0, r0=r0, r=r1, start=start, end=end, fill=S_score),
+               colour="white", size=0.3) +
+  scale_fill_gradientn(
+    name    = "Severity S",
+    colours = c("#B5E3C6", "#49B4C5", "#244A71"),
+    limits  = c(0, 1),
+    guide   = guide_colourbar(
+      direction = "horizontal",
+      barwidth  = unit(8,  "cm"),
+      barheight = unit(1,  "cm")
+    )
+  ) +
+  geom_segment(data = labels_df,
+               aes(x=0, y=r_mid, xend=x_line_end, yend=y_line_end),
+               colour="grey30", linetype="dotted", size=0.8) +
+  geom_text(data = labels_df,
+            aes(x=x_text, y=y_text, label=symptom, hjust=hjust),
+            family="Helvetica", fontface="bold", size=8, colour="black") +
+  coord_fixed(xlim = c(-outer_R, outer_R*1.6),
+              ylim = c(-outer_R, outer_R),
+              expand = FALSE, clip = "off") +
+  theme_void() +
+  theme(
+    legend.position   = c(0.85, 0.10),
+    legend.direction  = "horizontal",
+    legend.background = element_rect(fill="white", colour=NA),
+    plot.margin       = margin(5.5, 90, 5.5, 5.5)
+  )
+
+# -------------------------------------------------------------------
+# Plot B: sorted by Locus
+# -------------------------------------------------------------------
+# 6B. Order patients by Locus
+patient_order_loc <- results_df %>%
+  distinct(patient_ID, Locus) %>%
+  filter(patient_ID %in% long_A$patient_ID) %>%
+  arrange(Locus, patient_ID) %>%
+  pull(patient_ID)
+
+long_loc <- long_A %>%
+  mutate(patient_ID = factor(patient_ID, levels = patient_order_loc))
+
+# 7B. Build ring & outer‐ring data for locus order
+sym_df_loc <- long_loc %>%
+  group_by(patient_ID, symptom) %>%
+  summarise(
+    missing = missing[1],
+    S_part  = sum(S_part),
+    S_score = S_score[1],
+    .groups = "drop"
+  ) %>%
+  arrange(factor(symptom, levels = symptoms)) %>%
+  mutate(
+    ridx  = as.integer(factor(symptom, levels = symptoms)),
+    r0    = inner_r + (ridx - 1) * ring_thk,
+    r1    = inner_r + ridx     * ring_thk,
+    idx   = as.integer(patient_ID) - 1,
+    start = 2 * pi * idx / n_pat,
+    end   = 2 * pi * (idx + 1) / n_pat,
+    present = S_part > 0
+  )
+outer_loc <- sym_df_loc %>%
+  distinct(patient_ID, S_score, .keep_all = TRUE) %>%
+  mutate(
+    r0 = inner_r + n_sym     * ring_thk,
+    r1 = inner_r + (n_sym+1) * ring_thk
+  )
+
+# 8B. Build locus‐ordered plot
+p_loc <- ggplot() +
+  geom_arc_bar(data = filter(sym_df_loc, missing),
+               aes(x0=0, y0=0, r0=r0, r=r1, start=start, end=end),
+               fill="grey80", colour=NA) +
+  geom_arc_bar(data = filter(sym_df_loc, present),
+               aes(x0=0, y0=0, r0=r0, r=r1, start=start, end=end),
+               fill="black", colour=NA) +
+  geom_arc_bar(data = sym_df_loc,
+               aes(x0=0, y0=0, r0=r0, r=r1, start=start, end=end),
+               fill=NA, colour="grey80", size=0.2) +
+  geom_arc_bar(data = outer_loc,
+               aes(x0=0, y0=0, r0=r0, r=r1, start=start, end=end, fill=S_score),
+               colour="white", size=0.3) +
+  scale_fill_gradientn(
+    name    = "Severity S",
+    colours = c("#B5E3C6", "#49B4C5", "#244A71"),
+    limits  = c(0, 1),
+    guide   = guide_colourbar(
+      direction = "horizontal",
+      barwidth  = unit(8,  "cm"),
+      barheight = unit(1,  "cm")
+    )
+  ) +
+  geom_segment(data = labels_df,
+               aes(x=0, y=r_mid, xend=x_line_end, yend=y_line_end),
+               colour="grey30", linetype="dotted", size=0.8) +
+  geom_text(data = labels_df,
+            aes(x=x_text, y=y_text, label=symptom, hjust=hjust),
+            family="Helvetica", fontface="bold", size=8, colour="black") +
+  coord_fixed(xlim = c(-outer_R, outer_R*1.6),
+              ylim = c(-outer_R, outer_R),
+              expand = FALSE, clip = "off") +
+  theme_void() +
+  theme(
+    legend.position   = c(0.85, 0.10),
+    legend.direction  = "horizontal",
+    legend.background = element_rect(fill="white", colour=NA),
+    plot.margin       = margin(5.5, 90, 5.5, 5.5)
+  )
+
+print(p_sev)
+print(p_loc)
+
+# 10. Save 
+ggsave(
+  filename = file.path(output_dir, "plots/target_plot_by_severity_new.png"),
+  plot     = p_sev,
+  width    = 25, height = 12,
+  dpi      = 1200,
+  bg       = "white"
+)
+ggsave(
+  filename = file.path(output_dir, "plots/target_plot_by_severity_new.svg"),
+  plot     = p_sev,
+  width    = 25, height = 12,
+  device   = "svg",
+  dpi      = 1200,
+  bg       = "white"
+)
+ggsave(
+  filename = file.path(output_dir, "plots/target_plot_by_locus_new.png"),
+  plot     = p_loc,
+  width    = 25, height = 12,
+  dpi      = 1200,
+  bg       = "white"
+)
+ggsave(
+  filename = file.path(output_dir, "plots/target_plot_by_locus_new.svg"),
+  plot     = p_loc,
+  width    = 25, height = 12,
+  device   = "svg",
+  dpi      = 1200,
+  bg       = "white"
+)
+```
+
+## Figure 3C: Severity density across MAGEL2
+
+```{r 2D-Severity-Density-and-Death-Plot}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(viridis)
+
+# Define domains in bp positions
+domains_bp <- list(
+  proline_rich = c(1,       819 * 3),
+  U7BS         = c(820 * 3, 1027 * 3),
+  U7BS_MHD     = c(1028 * 3, 1034 * 3),
+  MHD          = c(1035 * 3, 1195 * 3),
+  after_MHD    = c(1196 * 3, Inf)
+)
+
+# 1 data prep
+# 1a. Severity points 
+raw_df <- results_df %>%
+  select(Locus, severity, sex) %>%
+  drop_na(severity, Locus)
+
+# 1b. Death-only points 
+death_df <- results_df %>%
+  filter(death == 1) %>%
+  select(Locus, sex)
+
+death_y <- 1.17
+
+# 2. Build plot
+p2d <- ggplot(raw_df, aes(x = Locus, y = severity)) +
+  
+  # A) Domain shading
+  annotate("rect",
+           xmin = domains_bp$proline_rich[1], xmax = domains_bp$proline_rich[2],
+           ymin = -Inf, ymax = Inf,
+           fill = "#E69F00", alpha = 0.5
+  ) +
+  annotate("rect",
+           xmin = domains_bp$U7BS[1], xmax = domains_bp$U7BS[2],
+           ymin = -Inf, ymax = Inf,
+           fill = "#66B2FF", alpha = 0.5
+  ) +
+  annotate("rect",
+           xmin = domains_bp$U7BS_MHD[1], xmax = domains_bp$U7BS_MHD[2],
+           ymin = -Inf, ymax = Inf,
+           fill = "#009E73", alpha = 0.4
+  ) +
+  annotate("rect",
+           xmin = domains_bp$MHD[1], xmax = domains_bp$MHD[2],
+           ymin = -Inf, ymax = Inf,
+           fill = "#99CC66", alpha = 0.5
+  ) +
+  annotate("rect",
+           xmin = domains_bp$after_MHD[1], xmax = domains_bp$after_MHD[2],
+           ymin = -Inf, ymax = Inf,
+           fill = "#CC79A7", alpha = 0.2
+  ) +
+  
+  # B) 2D density polygons
+  stat_density2d(
+    aes(fill = ..level..),
+    geom    = "polygon",
+    contour = TRUE,
+    n       = 200,
+    bins    = 20
+  ) +
+
+  # C) severity points
+  geom_point(
+    aes(shape = sex),
+    fill    = "black",
+    color   = "white",
+    size    = 2,
+    stroke  = 1,
+    alpha   = 0.2
+  ) +
+
+  # D) Death markers
+  geom_point(
+    data        = death_df,
+    aes(x = Locus, y = death_y, shape = sex),
+    fill        = "#DC3220",
+    color       = "#DC3220",
+    size        = 2,
+    stroke      = 1,
+    alpha       = 0.2,
+    inherit.aes = FALSE
+  ) +
+
+  # E) Shape mapping for sex-specific shapes
+  scale_shape_manual(values = c(f = 21, m = 22)) +
+
+  # F) Density fill scale
+  scale_fill_viridis_c(
+    option    = "inferno",
+    direction = -1,
+    name      = "Density"
+  ) +
+
+  # G) X-axis
+  scale_x_continuous(
+    limits = c(0, NA),
+    expand = expansion(mult = c(0, 0.02)),
+    breaks = scales::pretty_breaks(n = 5)
+  ) +
+
+  # H) Y-axis
+  scale_y_continuous(
+    limits = c(0, 1.2),
+    expand = expansion(mult = c(0, 0.02)),
+    breaks = scales::pretty_breaks(n = 7)
+  ) +
+
+  # I) Labels
+  labs(
+    title = "2D Density of Severity Across Locus Positions\n(with Death Events by Sex)",
+    x     = "Locus (cDNA base position)",
+    y     = "Severity"
+  ) +
+
+  # J) Theme
+  theme_minimal(base_family = "Arial", base_size = 22) +
+  theme(
+    panel.grid    = element_blank(),
+    axis.line     = element_line(color = "black"),
+    axis.ticks    = element_line(color = "black"),
+    plot.title    = element_text(face = "bold", size = 16, hjust = 0.5),
+    axis.text     = element_text(face = "bold", color = "black"),
+    axis.title    = element_text(face = "bold", color = "black"),
+    legend.title  = element_text(face = "bold"),
+    legend.text   = element_text(face = "bold")
+  )
+
+print(p2d)
+
+# 3. Save
+density_dir <- file.path(plots_dir, "density plot")
+dir.create(density_dir, recursive = TRUE, showWarnings = FALSE)
+ggsave(
+  filename = file.path(density_dir, "severity_Locus_2d_density_domains_with_deaths_by_sex.png"),
+  plot     = p2d,
+  device   = "png",
+  dpi      = 300,
+  width    = 8,
+  height   = 5
+)
+```
+
+## Figure 3D: Protein Characteristics as an alluvial flow plot
+
+```{r alluvial-flow, fig.width=14 , fig.height=6}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggalluvial)
+library(ggnewscale)
+
+# Prepare data
+df2 <- results_df %>%
+  filter(!is.na(severity), !is.na(`Protein_Length_[aa]`)) %>%
+  mutate(
+    Lnum = as.integer(`Protein_Length_[aa]`),
+    Snum = floor(severity / 0.01) * 0.01 + 0.005,
+    Sstr = factor(sprintf("%.3f", Snum),
+                  levels = sprintf("%.3f", sort(unique(Snum)))),
+    Lstr = factor(as.character(Lnum),
+                  levels = as.character(sort(unique(Lnum)))),
+    Domain = coalesce(Lost_Functional_Domains, "none") %>%
+               factor(levels = c("none",
+                                 "proline_rich",
+                                 "proline_rich, u7bs, mhd",
+                                 "u7bs, mhd",
+                                 "mhd")),
+    Signal = case_when(
+      lost_signals == "no signals lost"             ~ "none",
+      lost_signals == "NES1, NES2"                  ~ "NES1 & NES2",
+      lost_signals == "monopartite_NLS, NES1, NES2" ~ "mono NLS + NES1 & NES2",
+      TRUE                                           ~ lost_signals
+    ) %>% factor(levels = c("none","NES1 & NES2","mono NLS + NES1 & NES2"))
+  ) %>%
+  count(axis1 = Sstr, axis2 = Signal, axis3 = Domain, axis4 = Lstr,
+        Lnum, name = "count") %>%
+  mutate(
+    SignalCol = recode(as.character(axis2),
+      "none"                   = "#009E73",
+      "NES1 & NES2"            = "#56B4E9",
+      "mono NLS + NES1 & NES2" = "#E69F00"),
+    DomainCol = recode(as.character(axis3),
+      "none"                    = "grey80",
+      "proline_rich"            = "#E69F00",
+      "proline_rich, u7bs, mhd" = "#56B4E9",
+      "u7bs, mhd"               = "#009E73",
+      "mhd"                     = "#CC79A7")
+  )
+
+df_strata <- df2 %>%
+  pivot_longer(starts_with("axis"), names_to = "axis", values_to = "stratum") %>%
+  mutate(x = as.integer(sub("axis", "", axis)))
+
+# Build plot
+p <- ggplot() +
+  # a) flows
+  geom_flow(data = df2,
+            aes(axis1 = axis1, axis2 = axis2,
+                axis3 = axis3, axis4 = axis4,
+                y = count, fill = Lnum),
+            stat          = "alluvium",
+            lode.guidance = "forward",
+            width         = 0.20,
+            alpha         = 0.80) +
+  scale_fill_gradientn(
+    name    = "Protein\nlength (aa)",
+    colours = c(
+      "#B5E3C6",   
+      "#49B4C5",   
+      "#244A71"    
+    ),
+    guide   = "colourbar"
+  ) +
+  # b) strata blocks
+  ggnewscale::new_scale_fill() +
+  geom_stratum(
+    data        = df_strata,
+    inherit.aes = FALSE,
+    aes(x       = x,
+        stratum = stratum,
+        y       = count,
+        fill    = ifelse(x == 2, SignalCol,
+                  ifelse(x == 3, DomainCol, "grey90"))),
+    stat   = "stratum",
+    width  = 0.20,
+    colour = "white") +
+  scale_fill_identity(
+    name   = "Strata colour",
+    guide  = "legend",
+    breaks = c("#009E73", "#56B4E9", "#E69F00",
+               "#CC79A7", "grey80", "grey90"),
+    labels = c("Signal none  / Domain u7bs,mhd",
+               "Signal NES1 & NES2 / Domain proline_rich,u7bs,mhd",
+               "Signal mono NLS + NES1 & NES2 / Domain proline_rich",
+               "Domain mhd",
+               "Domain none",
+               "other (backdrop)")
+  ) +
+  # c) axes & theme
+  scale_x_continuous(breaks = 1:4,
+                     labels = c("Severity","Signal","Domain","Length"),
+                     expand = expansion(mult = 0.05)) +
+  scale_y_reverse(name = "Patient count") +
+  coord_flip() +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title.y     = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()) +
+  labs(
+    title    = "Alluvial Flow: Protein length → Domain → Signal → Severity",
+    subtitle = "Flows: Ocean-tier gradient (short light green → long deep blue); strata coloured by Signal & Domain"
+  )
+print(p)
+
+# Save
+alluvial_dir <- file.path(plots_dir, "alluvial")
+if (!dir.exists(alluvial_dir)) dir.create(alluvial_dir, recursive = TRUE, showWarnings = FALSE)
+ggsave(
+  filename = file.path(alluvial_dir, "ocean_tier_alluvial.png"),
+  plot     = p,
+  width    = 14, height = 6, dpi = 900
+)
+```
+
+## Figure S3: Correlogram
+
+```{r correlogram, message=FALSE, warning=FALSE}
+library(dplyr)
+library(stringr)
+library(corrplot)
+library(viridisLite)
+
+# Select continuous genotype predictors
+geno_cont_vars <- var_cat %>%
+  filter(
+    Genotype_or_Phenotype == "Genotype",
+    Type                 == "Continuous"
+  ) %>%
+  pull(Variable) %>%
+  intersect(colnames(results_df), .)
+
+# Subset + drop zero‐variance / too‐sparse
+continuous_df <- results_df %>%
+  select(severity, all_of(geno_cont_vars)) %>%
+  select_if(function(col) {
+    n_non_na <- sum(!is.na(col))
+    sd_val   <- sd(col, na.rm = TRUE)
+    n_non_na >= 10 && !is.na(sd_val) && sd_val > 0
+  })
+
+# Compute Pearson correlation
+corr_matrix <- cor(
+  as.matrix(continuous_df),
+  use    = "pairwise.complete.obs",
+  method = "pearson"
+)
+
+# Clean up names
+clean_names <- colnames(corr_matrix) %>%
+  str_replace_all("_", " ") %>%
+  str_replace_all("\\.", " ") %>%
+  str_replace_all("\\[aa\\]", "[aa]") %>%  
+  str_squish()
+
+rownames(corr_matrix) <- clean_names
+colnames(corr_matrix) <- clean_names
+
+# colors
+my_colors <- viridis(200, option = "D")
+
+# output directory
+corr_out <- file.path(output_dir, "correlation analysis")
+dir.create(corr_out, recursive = TRUE, showWarnings = FALSE)
+
+# Plot & save
+png(
+  filename = file.path(corr_out, "correlogram_severity_vs_genotypes.png"),
+  width    = 4500, height = 4500, res = 300
+)
+par(family = "Helvetica", font = 2, mar = c(1, 1, 2, 4))
+
+corrplot(
+  corr_matrix,
+  method      = "color",
+  type        = "upper",
+  col         = my_colors,
+  tl.col      = "black",
+  tl.srt      = 45,
+  tl.cex      = 1.0,
+  tl.font     = 2,
+  cl.cex      = 1.0, 
+  addCoef.col = "black",
+  number.cex  = 0.8,
+  number.font = 2,   
+  diag        = FALSE,
+  cl.pos      = "r",
+  cl.lim      = c(-1, 1)
+)
+
+# Legend title
+mtext(
+  text   = "Pearson r",
+  side   = 4,
+  line   = 2,
+  at     = 0.5,
+  cex    = 1.2,
+  family = "Helvetica",
+  font   = 2
+)
+
+# Main title
+title(
+  "Correlogram: Severity vs Continuous Genotypes",
+  line      = 0.5,
+  family    = "Helvetica",
+  font.main = 2
+)
+dev.off()
+
+```
+
+## Figure S5: TITER predictions visualized
+
+```{r lollipop-multiple-names, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(scales)
+
+# files and output directory
+file_paths <- c(
+  wt  = file.path("titer", "data", "wildtype_MAGEL2_candidate_predictions.csv"),
+  s7  = file.path("titer", "data", "individual_patients", "SYS#007", "candidate_predictions.csv"),
+  s55 = file.path("titer", "data", "individual_patients", "SYS#055", "candidate_predictions.csv")
+)
+out_dir <- file.path(plots_dir, "lollipop")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Loop through each file
+for (id in names(file_paths)) {
+  fp <- file_paths[[id]]
+  df <- read_csv(fp, show_col_types = FALSE)
+
+  # Compute mean & SD
+  stats <- df %>% summarise(mu = mean(Probability_With_Prior, na.rm=TRUE),
+                            sigma = sd(Probability_With_Prior, na.rm=TRUE))
+
+  # Categorize & size
+  df2 <- df %>%
+    mutate(
+      z        = (Probability_With_Prior - stats$mu) / stats$sigma,
+      sd_group = case_when(
+        z >  4  ~ "> 4 SD",
+        z >  3  ~ "> 3 SD",
+        z >  2  ~ "> 2 SD",
+        z >  1  ~ "> 1 SD",
+        TRUE    ~ "≤ 1 SD"
+      ) %>% factor(levels=c("≤ 1 SD","> 1 SD","> 2 SD","> 3 SD","> 4 SD")),
+      size_pt  = ifelse(sd_group != "≤ 1 SD",
+                        scales::rescale(Probability_With_Prior, to=c(1,5)),
+                        NA_real_)
+    )
+
+  # colors
+  sd_colors <- c(
+    "≤ 1 SD" = "#0072B2",
+    "> 1 SD" = "#009E73",
+    "> 2 SD" = "#F0E442",
+    "> 3 SD" = "#D55E00",
+    "> 4 SD" = "#CC79A7"
+  )
+
+  # plot
+  p <- ggplot(df2, aes(x=CDS_Position, y=Probability_With_Prior)) +
+    geom_hline(yintercept=stats$mu, linetype="dashed") +
+    geom_segment(aes(xend=CDS_Position, yend=0, color=sd_group), size=0.6) +
+    geom_point(data=filter(df2, sd_group!="≤ 1 SD"),
+               aes(fill=sd_group, size=size_pt),
+               shape=21, color="black", stroke=0.5) +
+    geom_text(data=filter(df2, sd_group=="> 4 SD"),
+              aes(label=CDS_Position),
+              vjust=-1.2, size=3, family="Arial", fontface="bold") +
+    scale_color_manual(values=sd_colors, name="Deviation from mean") +
+    scale_fill_manual(values=sd_colors, guide=FALSE) +
+    scale_size_identity() +
+    labs(
+      title    = "Candidate TIS Probabilities Along MAGEL2 CDS",
+      subtitle = "Mean probability (dashed); colored by SD above mean",
+      x        = "CDS Position (bp)",
+      y        = "Probability (with prior)"
+    ) +
+    scale_x_continuous(
+      expand = expansion(add=c(100,0), mult=c(0,0.02)),
+      breaks = pretty_breaks(n=8)
+    ) +
+    scale_y_continuous(
+      expand = expansion(mult=c(0,0.05)),
+      breaks = pretty_breaks(n=6)
+    ) +
+    theme_minimal(base_family="Arial", base_size=14) +
+    theme(
+      text                = element_text(family="Arial", face="bold"),
+      plot.title          = element_text(size=18, margin=margin(b=5)),
+      plot.subtitle       = element_text(size=12, margin=margin(b=20)),
+      plot.title.position = "plot",
+      plot.margin         = margin(t=50, r=20, b=10, l=20),
+      axis.title          = element_text(size=14),
+      axis.text.x         = element_text(size=12, angle=45, hjust=1),
+      axis.text.y         = element_text(size=12),
+      axis.line           = element_line(size=0.8, color="black"),
+      axis.ticks          = element_line(size=0.8, color="black"),
+      axis.ticks.length   = unit(0.25, "cm"),
+      panel.grid          = element_blank(),
+      legend.position     = "right",
+      legend.title        = element_text(size=12),
+      legend.text         = element_text(size=10)
+    )
+
+  # filename
+  fname <- switch(id,
+    wt  = "wildtype_lollipop.png",
+    s7  = "SYS007_1996dupC_lollipop.png",
+    s55 = "SYS055_1996delC_lollipop.png"
+  )
+
+  ggsave(
+    filename = fname,
+    plot     = p,
+    path     = out_dir,
+    device   = "png",
+    dpi      = 300,
+    width    = 18,
+    height   = 7
+  )
+}
+```
+
+## CSVs to .xlsx
+
+Combine multiple .csv files into one .xlsx spreadsheet with multiple sheets
+
+```{r multiple csv files to xlsx}
+library(tools)
+
+# helpers
+`%||%` <- function(a, b) if (!is.null(a) && !is.na(a) && nzchar(a)) a else b
+
+determine_folder <- function(default = NULL) {
+  cand <- default %||% getOption("csv_folder") %||% Sys.getenv("CSV_FOLDER", "")
+  if (nzchar(cand) && dir.exists(cand)) return(normalizePath(cand, winslash = "/"))
+
+  if (interactive()) {
+    if (requireNamespace("rstudioapi", quietly = TRUE) &&
+        isTRUE(try(rstudioapi::isAvailable(), silent = TRUE))) {
+      sel <- try(rstudioapi::selectDirectory(caption = "Select folder with CSV files"),
+                 silent = TRUE)
+      if (!inherits(sel, "try-error") && length(sel) && nzchar(sel)) return(sel)
+    }
+    if (requireNamespace("tcltk", quietly = TRUE)) {
+      sel <- try(tcltk::tk_choose.dir(default = ".", caption = "Select folder with CSV files"),
+                 silent = TRUE)
+      if (!inherits(sel, "try-error") && !is.na(sel) && nzchar(sel)) return(sel)
+    }
+  }
+  NULL
+}
+
+shorten_sheet_name <- function(name, maxlen = 31) {
+  parts <- strsplit(name, "_", fixed = TRUE)[[1]]
+  shortened <- parts
+  repeat {
+    cand <- paste(shortened, collapse = "_")
+    if (nchar(cand) <= maxlen) return(cand)
+    i <- which.max(nchar(shortened))
+    if (nchar(shortened[i]) > 1) shortened[i] <- substr(shortened[i], 1, nchar(shortened[i]) - 1) else break
+  }
+  substr(paste(shortened, collapse = "_"), 1, maxlen)
+}
+
+# main
+folder <- determine_folder()
+
+if (is.null(folder) || !dir.exists(folder)) {
+  message("No folder selected; skipping CSV → XLSX aggregation.")
+} else {
+  csv_files <- list.files(path = folder, pattern = "\\.csv$", full.names = TRUE)
+  if (length(csv_files) == 0) {
+    message("No CSV files found in: ", folder, ". Skipping.")
+  } else {
+    output_file <- file.path(folder, "combined.xlsx")
+
+    if (requireNamespace("openxlsx", quietly = TRUE)) {
+      wb <- openxlsx::createWorkbook()
+      for (f in csv_files) {
+        raw_name   <- file_path_sans_ext(basename(f))
+        sheet_name <- shorten_sheet_name(make.names(raw_name))
+        dat <- utils::read.csv(f, stringsAsFactors = FALSE, check.names = FALSE)
+        openxlsx::addWorksheet(wb, sheetName = sheet_name)
+        openxlsx::writeData(wb, sheet = sheet_name, x = dat)
+      }
+      openxlsx::saveWorkbook(wb, output_file, overwrite = TRUE)
+      message("Combined Excel file saved to: ", output_file)
+    } else if (requireNamespace("writexl", quietly = TRUE)) {
+      sheets <- setNames(vector("list", length(csv_files)), nm = character(length(csv_files)))
+      for (i in seq_along(csv_files)) {
+        f <- csv_files[i]
+        raw_name   <- file_path_sans_ext(basename(f))
+        sheet_name <- shorten_sheet_name(make.names(raw_name))
+        sheets[[i]] <- utils::read.csv(f, stringsAsFactors = FALSE, check.names = FALSE)
+        names(sheets)[i] <- sheet_name
+      }
+      writexl::write_xlsx(sheets, path = output_file)
+      message("Combined Excel file saved to: ", output_file)
+    } else {
+      message("Neither 'openxlsx' nor 'writexl' is installed; cannot write Excel. ",
+              "Install one of them to enable export.")
+    }
+  }
+}
+```
+
+## Workspace maintenance
+
+Save current workspace image to allow later reloading
+
+```{r save-current-workspace, message=TRUE, warning=FALSE}
+folder <- file.path("saved_workspaces")
+if(!dir.exists(folder)) dir.create(folder)
+filename <- paste0("workspace_", Sys.Date(), ".RData")
+filepath <- file.path(folder, filename)
+save.image(filepath)
+```
+
+Load latest saved workspace
+
+```{r load-saved-workspace, message=TRUE, warning=TRUE}
+
+load_latest_workspace <- function() {
+   folder <- file.path(getwd(), "saved_workspaces")
+   if(!dir.exists(folder)) stop("No saved_workspaces directory")
+   files <- list.files(path = folder, pattern = "^workspace_.*\\.RData$", full.names = TRUE)
+   if(length(files) == 0) stop("No workspace images found")
+   latest_file <- files[order(file.info(files)$mtime, decreasing = TRUE)][1]
+   load(latest_file)
+   message("Loaded workspace from file: ", latest_file)
+}
+
+load_latest_workspace()
+```
