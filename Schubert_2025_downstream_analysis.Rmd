@@ -2738,21 +2738,10 @@ df_heat <- results_df %>%
   filter(!is.na(severity_score)) %>%
   arrange(severity_score, patient_ID)
 
-# Robust min-max scaling for the severity side annotation
-severity_span <- diff(range(df_heat$severity_score, na.rm = TRUE))
-df_heat <- df_heat %>%
-  mutate(
-    severity_01 = if_else(
-      severity_span == 0,
-      0.5,
-      (severity_score - min(severity_score, na.rm = TRUE)) / severity_span
-    )
-  )
-
 # Determine symptom columns and filter by prevalence
 symptom_cols_all <- setdiff(
   names(df_heat),
-  c("patient_ID", "severity_score", "severity_01")
+  c("patient_ID", "severity_score")
 )
 
 present_counts <- df_heat %>%
@@ -2776,13 +2765,16 @@ mat <- apply(mat, c(1, 2), function(x) {
   }
   as.character(as.integer(x))
 })
+sev <- df_heat$severity_score
 
-sev <- df_heat$severity_01
+rng <- range(sev, na.rm = TRUE)
+mid <- mean(rng)
 
 col_sev <- colorRamp2(
-  c(0, 0.5, 1),
+  c(rng[1], mid, rng[2]),
   c("#005F73", "white", "#AE2012")
 )
+
 
 row_ha <- rowAnnotation(
   severity = sev,
@@ -2792,8 +2784,8 @@ row_ha <- rowAnnotation(
 )
 
 col_sym <- c(
-  "0" = "#55C2DD",
-  "1" = "#997448"
+  "0" = "#005F73",
+  "1" = "#AE2012"
 )
 
 ht <- Heatmap(
@@ -2820,24 +2812,15 @@ draw(ht)
 heatmap_out_dir <- file.path(output_dir, "plots")
 dir.create(heatmap_out_dir, recursive = TRUE, showWarnings = FALSE)
 
-png(
-  filename = file.path(heatmap_out_dir, "target_heatmap_by_severity_complexheatmap.png"),
-  width = 18,
-  height = 12,
-  units = "in",
-  res = 1200,
-  bg = "white"
+pdf(
+  file = file.path(heatmap_out_dir, "target_heatmap_by_severity_complexheatmap.pdf"),
+  width = 4,
+  height = 3,
+  bg = "transparent"
 )
-draw(ht)
-dev.off()
 
-svg(
-  filename = file.path(heatmap_out_dir, "target_heatmap_by_severity_complexheatmap.svg"),
-  width = 18,
-  height = 12,
-  bg = "white"
-)
 draw(ht)
+
 dev.off()
 ```
 
