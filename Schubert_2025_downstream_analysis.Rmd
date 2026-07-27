@@ -1,7 +1,7 @@
 ---
 title: "Downstream analysis"
 author: "Tim Schubert"
-date: "2026-02-21"
+date: "2026-07-27"
 output:
   html_document: default
   pdf_document: default
@@ -1087,6 +1087,13 @@ zeros_after <- sum(results_df$`Frameshift_Length_[aa]` == 0, na.rm = TRUE)
 nas_after  <- sum(is.na(results_df$`Frameshift_Length_[aa]`))
 cat("Zeros after replacement:", zeros_after, "\n")
 cat("NAs after replacement:", nas_after, "\n")
+
+# Reclassify frameshifting indels with missing frameshift length as Nonsense
+reclassify_idx <- results_df$Mutation_Type == "Frameshifting indel" &
+  is.na(results_df$`Frameshift_Length_[aa]`)
+n_reclassified <- sum(reclassify_idx, na.rm = TRUE)
+results_df$Mutation_Type[reclassify_idx] <- "Nonsense"
+cat("Reclassified to Nonsense:", n_reclassified, "\n")
 ```
 
 ## Further Downstream Analysis
@@ -1155,7 +1162,6 @@ write_xlsx(
   path = save_path
 )
 ```
-
 
 ### Severity by genotype variables
 
@@ -1558,7 +1564,7 @@ build_prevalence_and_posthoc_tables_by_group <- function(group_var, output_folde
   if(length(valid_lvls) < 2) stop("Not enough levels for ", group_var)
   
   overall_list <- list()
-  posthoc_list <- list()
+  ct_list <- list()
   
   for(symp in symptoms) {
     # 3) build contingency table
@@ -1569,6 +1575,7 @@ build_prevalence_and_posthoc_tables_by_group <- function(group_var, output_folde
     })
     ct <- matrix(ct, nrow=2, byrow=FALSE,
                  dimnames=list(c("Absent","Present"), valid_lvls))
+    ct_list[[symp]] <- ct
     
     # 4) global test
     p_glob <- NA; test_glob <- "Insufficient data"; min_exp <- NA
@@ -1589,7 +1596,6 @@ build_prevalence_and_posthoc_tables_by_group <- function(group_var, output_folde
         }
       }
     }
-    q_glob <- if(!is.na(p_glob)) p.adjust(p_glob, method="BH") else NA_real_
     
     # 5) per-level prevalence + CI
     lvl_stats <- map(valid_lvls, function(lvl) {
@@ -1599,42 +1605,61 @@ build_prevalence_and_posthoc_tables_by_group <- function(group_var, output_folde
     col_nms <- unlist(map(valid_lvls, ~ paste0(.x, c("_Ratio","_Prev","_CI","_N"))))
     names(lvl_stats) <- col_nms
     
-    # 6) post-hoc if global q<0.1
-    posthoc_summary <- NA_character_
-    if(!is.na(q_glob) && q_glob < 0.1) {
-      pairs <- combn(valid_lvls,2, simplify=FALSE)
-      ph <- map_dfr(pairs, function(pr) {
-        l1<-pr[1]; l2<-pr[2]
-        a1<-ct["Present",l1]; n1<-sum(ct[,l1])
-        a2<-ct["Present",l2]; n2<-sum(ct[,l2])
-        r2 <- exact2x2::boschloo(a1,n1,a2,n2)
-        tibble(
-          Symptom      = name_map[[symp]] %||% symp,
-          Pair         = paste(l1,"vs",l2),
-          Pair_Test    = "Boschloo",
-          Pair_p.value = r2$p.value
-        )
-      }) %>% mutate(pairwise_q = p.adjust(Pair_p.value, "BH"))
-      posthoc_summary <- paste(
-        sprintf("%s: p=%.3g,q=%.3g", ph$Pair, ph$Pair_p.value, ph$pairwise_q),
-        collapse=" | "
-      )
-      posthoc_list[[symp]] <- ph
-    }
-    
     overall_list[[symp]] <- tibble(
       Symptom         = name_map[[symp]] %||% symp,
       !!!as.list(lvl_stats),
       TestUsed        = test_glob,
       p.value         = p_glob,
       min.expected    = min_exp,
-      q.value         = q_glob,
-      PostHoc_Summary = posthoc_summary
+      PostHoc_Summary = NA_character_
     )
   }
   
-  overall_df <- bind_rows(overall_list)
-  posthoc_df  <- bind_rows(posthoc_list)
+  overall_df <- bind_rows(overall_list) %>%
+    mutate(q.value = p.adjust(p.value, method = "BH"))
+  
+  # 6) post-hoc if global q<0.1 and k>2
+  posthoc_list <- list()
+  for (symp in symptoms) {
+    symptom_clean <- name_map[[symp]] %||% symp
+    q_glob <- overall_df$q.value[overall_df$Symptom == symptom_clean]
+    ct <- ct_list[[symp]]
+    if (length(q_glob) != 1L || is.na(q_glob) || q_glob >= 0.1 || ncol(ct) <= 2L) next
+    
+    pairs <- combn(valid_lvls, 2, simplify = FALSE)
+    ph <- map_dfr(pairs, function(pr) {
+      l1 <- pr[1]; l2 <- pr[2]
+      a1 <- ct["Present", l1]; n1 <- sum(ct[, l1])
+      a2 <- ct["Present", l2]; n2 <- sum(ct[, l2])
+      r2 <- exact2x2::boschloo(a1, n1, a2, n2)
+      tibble(
+        Symptom      = symptom_clean,
+        Pair         = paste(l1, "vs", l2),
+        Pair_Test    = "Boschloo",
+        Pair_p.value = r2$p.value
+      )
+    })
+    posthoc_list[[symp]] <- ph
+  }
+  
+  posthoc_df <- bind_rows(posthoc_list)
+  if (nrow(posthoc_df) > 0L) {
+    posthoc_df <- posthoc_df %>%
+      mutate(pairwise_q = p.adjust(Pair_p.value, method = "BH"))
+    ph_summ <- posthoc_df %>%
+      group_by(Symptom) %>%
+      summarise(
+        PostHoc_Summary = paste(
+          sprintf("%s: p=%.3g,q=%.3g", Pair, Pair_p.value, pairwise_q),
+          collapse = " | "
+        ),
+        .groups = "drop"
+      )
+    overall_df <- overall_df %>%
+      left_join(ph_summ, by = "Symptom") %>%
+      mutate(PostHoc_Summary = coalesce(PostHoc_Summary.y, PostHoc_Summary.x)) %>%
+      select(-PostHoc_Summary.x, -PostHoc_Summary.y)
+  }
   
   dir.create(output_folder, recursive=TRUE, showWarnings=FALSE)
   write_csv(overall_df, file.path(output_folder, paste0("prevalence_by_",group_var,".csv")))
@@ -1646,162 +1671,226 @@ build_prevalence_and_posthoc_tables_by_group <- function(group_var, output_folde
 group_vars <- c(
   "Mutation_Type",
   "Domain_Location_Of_Variant",
-  "Lost_Functional_Domains",
-  "Lost_Functional_Domains_in_protein_from_non_canonical_in_frame_TIS",
   "1996dupC",
+  "Lost_Functional_Domains",
   "lost_signals"
 )
-output_folder <- "output/tables/prevalence_by_genotype"
+output_folder <- file.path(tables_dir, "prevalence_by_genotype")
 
 purrr::walk(group_vars,
             ~ build_prevalence_and_posthoc_tables_by_group(.x, output_folder)
 )
 ```
 
-**Generation of genotype-variable-specific Radar Charts:**
+**Figure 2. Comparison of clinical features across different genotype categories.** A heatmap illustrates the prevalence of SYS score symptoms for (A) variant type, (B) domain location of variant, (C) hotspot variant, (D) affected functional domains, and (E) missing nuclear signals. Each cell represents the percentage of individuals exhibiting a specific symptom.
 
-```{r radar-charts-for-categorical-genotype-variables, message=FALSE, warning=FALSE}
+```{r symptom-prevalence-heatmap-by-genotype, message=FALSE, warning=FALSE}
 library(dplyr)
 library(tidyr)
-library(ggradar)
-library(scales)
-library(ggplot2)
 library(readr)
-library(openxlsx)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
 
-include_vars <- c("hypotonia", "GERD", "respiratory distress", 
-                  "contractures", "scoliosis", "short extremities")
+sys_vars <- c(
+  "hypotonia", "GERD", "respiratory distress",
+  "contractures", "scoliosis", "short extremities"
+)
 
-group_vars <- c("Mutation_Type", 
-                "Domain_Location_Of_Variant", 
-                "Lost_Functional_Domains", 
-                "Lost_Functional_Domains_in_protein_from_non_canonical_in_frame_TIS", 
-                "1996dupC", 
-                "lost_signals")
+group_vars <- c(
+  "Mutation_Type",
+  "Domain_Location_Of_Variant",
+  "1996dupC",
+  "Lost_Functional_Domains",
+  "lost_signals"
+)
 
-# Paths
-input_folder <- file.path(tables_dir, "symptom prevalence for categorical genotype variables")
-plots_folder <- plots_dir
-if (!dir.exists(plots_folder)) dir.create(plots_folder, recursive = TRUE)
+panel_titles <- c(
+  Mutation_Type = "Variant type",
+  Domain_Location_Of_Variant = "Domain location of variant",
+  `1996dupC` = "Hotspot variant",
+  Lost_Functional_Domains = "Affected functional domains",
+  lost_signals = "Missing nuclear signals"
+)
 
-# Colors
-group_colors <- c("#E69F00", "#56B4E9", "#009E73", "#CC79A7", "#BCB334")
+col_order_by_group <- list(
+  Mutation_Type = c("Frameshifting indel", "Nonsense", "Missense"),
+  Domain_Location_Of_Variant = c("proline_rich", "u7bs", "mhd"),
+  `1996dupC` = c("c.1996dupC", "other_mutation"),
+  Lost_Functional_Domains = c(
+    "proline_rich", "proline_rich, u7bs, mhd",
+    "u7bs", "u7bs, mhd", "mhd"
+  ),
+  lost_signals = c(
+    "monopartite_NLS, NES1, NES2", "NES1, NES2", "no signals lost"
+  )
+)
+
+input_folder <- file.path(tables_dir, "prevalence_by_genotype")
+cell_side_cm <- 0.85
+block_gap_cm <- 0.75
+prev_rng <- c(0, 100)
+prev_mid <- mean(prev_rng)
+col_fun <- colorRamp2(
+  c(prev_rng[1], prev_mid, prev_rng[2]),
+  c("#005F73", "white", "#AE2012")
+)
+
+panel_titles_short <- panel_titles
+
+significant_symptoms <- character()
+for (group in group_vars) {
+  overall_df <- read_csv(
+    file.path(input_folder, paste0("prevalence_by_", group, ".csv")),
+    show_col_types = FALSE
+  )
+  significant_symptoms <- union(
+    significant_symptoms,
+    overall_df %>%
+      filter(Symptom %in% sys_vars, q.value < 0.10) %>%
+      pull(Symptom)
+  )
+  posthoc_path <- file.path(input_folder, paste0("posthoc_by_", group, ".csv"))
+  if (file.exists(posthoc_path) && file.info(posthoc_path)$size > 0L) {
+    posthoc_df <- read_csv(posthoc_path, show_col_types = FALSE)
+    significant_symptoms <- union(
+      significant_symptoms,
+      posthoc_df %>%
+        filter(Symptom %in% sys_vars, pairwise_q < 0.10) %>%
+        pull(Symptom)
+    )
+  }
+}
+include_vars <- sys_vars[sys_vars %in% significant_symptoms]
+
+col_mats <- list()
+col_labels <- character()
+col_splits <- character()
 
 for (group in group_vars) {
-  
-  # Read prevalence table
-  overall_file <- file.path(input_folder, paste0("prevalence_by_", group, ".csv"))
-  overall_df   <- read_csv(overall_file, show_col_types = TRUE)
-  
-  # Filter symptoms
-  radar_df <- overall_df %>% 
-    filter(Symptom %in% include_vars)
-  
-  # Find prevalence columns
-  prevalence_cols <- grep("_Prevalence$", colnames(radar_df), value = TRUE)
-  
-  # Long format
-  radar_long <- radar_df %>%
-    dplyr::select(Symptom, all_of(prevalence_cols)) %>%
-    pivot_longer(
-      cols      = -Symptom,
-      names_to  = "Group",
-      values_to = "Prevalence"
-    ) %>%
-    mutate(
-      Group = gsub("_Prevalence", "", Group),
-      Group = gsub("_", " ", Group)
-    )
-  
-  # Wide format + scale & replace NAs only in numeric columns
-  radar_wide <- radar_long %>%
-    pivot_wider(names_from = Symptom, values_from = Prevalence) %>%
-    mutate(Group = as.factor(Group)) %>%
-    dplyr::select(Group, all_of(include_vars)) %>%
-    mutate(across(-Group, ~ replace_na(.x / 100, 0)))
-  
-  # Axis labels
-  symptom_labels <- include_vars
-  symptom_labels[symptom_labels == "respiratory distress"] <- "respiratory\ndistress"
-  symptom_labels[symptom_labels == "short extremities"]   <- "short\nextremities"
-  colnames(radar_wide)[-1] <- symptom_labels
-  
-  # Reorder levels
-  if (group == "Domain_Location_Of_Variant") {
-    radar_wide$Group <- factor(radar_wide$Group,
-      levels = c("proline rich", "u7bs", "mhd")
-    )
-  }
-  if (group == "Lost_Functional_Domains") {
-    radar_wide$Group <- factor(radar_wide$Group,
-      levels = c(
-        "proline rich", 
-        "proline rich, u7bs, mhd",
-        "u7bs",
-        "u7bs, mhd",
-        "mhd"
-      )
-    )
-  }
-  if (group == "Mutation_Type") {
-    radar_wide$Group <- factor(radar_wide$Group,
-      levels = c(
-        "Frameshifting indel", 
-        "Nonsense",
-        "Missense"
-      )
-    )
-  }
-  
-  # Colors
-  used_colors <- group_colors[ seq_along(unique(radar_wide$Group)) ]
-  
-  # Build radar chart
-  p <- ggradar(
-    radar_wide,
-    grid.min                      = 0,
-    grid.mid                      = 0.5,
-    grid.max                      = 1,
-    grid.label.size               = 3,
-    values.radar                  = c("", "", ""),
-    axis.label.size               = 2,
-    axis.label.offset             = 1.15,
-    plot.legend                   = TRUE,
-    plot.extent.x.sf              = 1.3,
-    plot.extent.y.sf              = 1.3,
-    gridline.min.linetype         = "dashed",
-    gridline.mid.linetype         = "dashed",
-    gridline.max.linetype         = "dashed",
-    gridline.min.colour           = "grey70",
-    gridline.mid.colour           = "grey70",
-    gridline.max.colour           = "grey70",
-    background.circle.colour      = "grey90",
-    background.circle.transparency = 0.2,
-    group.colours                 = used_colors,
-    fill                          = TRUE,
-    fill.alpha                    = 0.1,
-    group.point.size              = 0
-  ) +
-    scale_fill_manual(values = used_colors) +
-    scale_color_manual(values = used_colors) +
-    guides(
-      fill  = guide_legend(title = "", ncol = 1),
-      color = guide_legend(title = "", ncol = 1)
-    ) +
-    theme(
-      legend.text   = element_text(size = 5, face = "bold", family = "Arial"),
-      axis.text     = element_text(size = 5,  face = "bold", family = "Arial"),
-      legend.position      = c(-0.5, 0),
-      legend.justification = c(0, 0),
-      plot.margin          = margin(t = 10, r = 30, b = 10, l = 30, unit = "pt")
-    )
-  
-  # Save
-  output_file <- file.path(plots_folder, paste0("radar_plot_", group, ".png"))
-  ggsave(output_file, p, width = 10, height = 3, dpi = 300)
-  cat("Radar plot for", group, "saved to:", output_file, "\n")
-  print(p)
+  overall_df <- read_csv(
+    file.path(input_folder, paste0("prevalence_by_", group, ".csv")),
+    show_col_types = FALSE
+  )
+
+  prev_cols <- grep("_Prev$", names(overall_df), value = TRUE)
+  level_names <- sub("_Prev$", "", prev_cols)
+
+  mat_df <- overall_df %>%
+    filter(Symptom %in% include_vars) %>%
+    select(Symptom, all_of(prev_cols))
+
+  mat <- as.matrix(mat_df[, prev_cols, drop = FALSE])
+  rownames(mat) <- mat_df$Symptom
+  colnames(mat) <- level_names
+  mat <- mat[include_vars, , drop = FALSE]
+
+  col_order <- intersect(col_order_by_group[[group]], colnames(mat))
+  if (length(col_order) == 0L) col_order <- colnames(mat)
+  mat <- mat[, col_order, drop = FALSE]
+
+  colnames(mat) <- paste0(group, "::", colnames(mat))
+  col_mats[[group]] <- mat
+  col_labels <- c(col_labels, col_order)
+  col_splits <- c(col_splits, rep(panel_titles_short[[group]], ncol(mat)))
 }
+
+combined_mat <- do.call(cbind, col_mats)
+rownames(combined_mat) <- include_vars
+
+column_split <- factor(col_splits, levels = unname(panel_titles_short[group_vars]))
+
+col_label_display <- dplyr::recode(
+  col_labels,
+  "Frameshifting indel" = "Frameshift",
+  "Nonsense" = "Nonsense",
+  "Missense" = "Missense",
+  "proline_rich" = "Proline-rich",
+  "u7bs" = "U7BS",
+  "mhd" = "MHD",
+  "monopartite_NLS, NES1, NES2" = "monopartite NLS, NES1, NES2",
+  "NES1, NES2" = "NES1, NES2",
+  "no signals lost" = "none",
+  "proline_rich, u7bs, mhd" = "Proline-rich, U7BS, MHD",
+  "u7bs, mhd" = "U7BS, MHD",
+  "other_mutation" = "other variant",
+  .default = col_labels
+)
+
+n_row <- nrow(combined_mat)
+n_col <- ncol(combined_mat)
+n_slice <- length(group_vars)
+body_width_cm <- n_col * cell_side_cm + (n_slice - 1L) * block_gap_cm
+body_height_cm <- n_row * cell_side_cm
+
+col_name_gp <- gpar(fontsize = 7.5, col = "black")
+col_name_height_cm <- convertUnit(
+  max_text_width(col_label_display, gp = col_name_gp, rot = 45),
+  "cm",
+  valueOnly = TRUE
+) + 0.15
+
+row_name_gp <- gpar(fontsize = 9)
+row_name_width_cm <- convertUnit(
+  max_text_width(include_vars, gp = row_name_gp),
+  "cm",
+  valueOnly = TRUE
+) + 0.3
+
+column_title_height_cm <- 0.45
+
+ht <- Heatmap(
+  combined_mat,
+  name = "Prevalence",
+  col = col_fun,
+  na_col = "white",
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  column_split = column_split,
+  column_gap = unit(block_gap_cm, "cm"),
+  column_title_gp = gpar(fontsize = 9, fontface = "bold"),
+  row_labels = include_vars,
+  row_names_side = "left",
+  row_names_gp = row_name_gp,
+  column_labels = col_label_display,
+  column_names_side = "bottom",
+  column_names_rot = 45,
+  column_names_centered = FALSE,
+  column_names_gp = col_name_gp,
+  column_names_max_height = unit(col_name_height_cm, "cm"),
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  heatmap_legend_param = list(
+    title = "Prevalence",
+    at = c(0, 25, 50, 75, 100),
+    legend_height = unit(4, "cm")
+  ),
+  rect_gp = gpar(col = "white", lwd = 1),
+  width = unit(body_width_cm, "cm"),
+  height = unit(body_height_cm, "cm"),
+  cell_fun = function(j, i, x, y, w, h, fill) {
+    if (is.na(combined_mat[i, j])) {
+      grid.text(
+        "\u00d7",
+        x, y,
+        gp = gpar(fontsize = 9, col = "grey45", fontface = "bold")
+      )
+    }
+  }
+)
+
+out_file <- file.path(plots_dir, "symptom_prevalence_heatmap_by_genotype.pdf")
+content_w_cm <- row_name_width_cm + body_width_cm + 2.6
+content_h_cm <- column_title_height_cm + body_height_cm + col_name_height_cm + 0.35
+
+pdf(out_file, width = content_w_cm, height = content_h_cm, bg = "white")
+draw(
+  ht,
+  padding = unit(c(0.4, 0.35, 0.25, 0.35), "cm")
+)
+dev.off()
+
+cat("Symptom prevalence heatmap saved to:", out_file, "\n")
 ```
 
 #### Continuous genotype variables
@@ -2051,7 +2140,7 @@ forest_df <- logit_tbl %>%
     CI_hi    = OR100_Marg_U95,
     p.value  = MarginalSlope_p.value,
     q.value  = MarginalSlope_q.value,
-    sig      = p.value < 0.05,
+    sig      = q.value < 0.1,
     Symptom  = if_else(sig, paste0(Symptom, " *"), Symptom),
     ORlabel  = sprintf("%.2f [%.2f, %.2f]", OR100, CI_lo, CI_hi),
     pqlabel  = sprintf("p=%.3f\nq=%.3f", p.value, q.value)
@@ -2328,6 +2417,282 @@ sheets[["Protein_Length_continuous"]] <-
 out_file <- file.path(tables_dir, "gnomad_vs_results_comparison.xlsx")
 write_xlsx(sheets, path = out_file)
 message("✔ Written: ", out_file)
+```
+
+### gnomAD coding MAGEL2 landscape
+
+Allele counts and ClinVar annotation of all coding MAGEL2 gnomAD variants (no ClinVar filter); singleton rates by mutation class; PTVs ranked by allele count; allele-count panel (PTV vs non-PTV).
+
+```{r gnomad-coding-landscape, echo=TRUE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(readr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(grid)
+
+g <- read_csv(
+  file.path(data_dir, "MAP_results_gnomAD_without_UTRs.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(
+    Mutation_Type = replace_na(`Mutation Type`, "NA"),
+    clin = ClinVar.Germline.Classification,
+    clin = if_else(is.na(clin) | clin == "", "unannotated", as.character(clin)),
+    mut_class = case_when(
+      Mutation_Type %in% c("Nonsense", "Frameshifting indel") ~ "PTV",
+      Mutation_Type == "Silent" ~ "Silent",
+      Mutation_Type %in% c("Missense", "In-Frame indel") ~ "Missense/in-frame",
+      TRUE ~ "Other"
+    ),
+    clin_group = case_when(
+      clin == "unannotated" ~ "unannotated",
+      clin %in% c("Benign", "Likely benign", "Benign/Likely benign") ~ "benign/LB",
+      clin == "Uncertain significance" ~ "VUS",
+      clin %in% c("Pathogenic", "Likely pathogenic", "Pathogenic/Likely pathogenic") ~ "pathogenic/LP",
+      clin == "Conflicting classifications of pathogenicity" ~ "conflicting",
+      TRUE ~ "other"
+    ),
+    singleton = Allele.Count == 1
+  )
+
+# 1) All gnomAD by mutation type
+by_type <- g %>%
+  count(Mutation_Type, name = "n") %>%
+  mutate(pct = round(100 * n / sum(n), 2)) %>%
+  arrange(desc(n))
+
+# 2) Mutation class × ClinVar group
+by_class_clinvar <- g %>%
+  filter(mut_class != "Other") %>%
+  count(mut_class, clin_group, name = "n") %>%
+  group_by(mut_class) %>%
+  mutate(
+    n_class = sum(n),
+    pct_of_class = round(100 * n / n_class, 1)
+  ) %>%
+  ungroup() %>%
+  arrange(mut_class, desc(n))
+
+# 3) Singleton rates (PTV aggregate + Missense + Silent, matching manuscript text)
+by_singleton <- bind_rows(
+  g %>%
+    filter(mut_class == "PTV") %>%
+    summarise(
+      mut_class = "PTV",
+      n = n(),
+      n_singleton = sum(singleton, na.rm = TRUE),
+      pct_singleton = round(100 * mean(singleton, na.rm = TRUE), 1)
+    ),
+  g %>%
+    filter(Mutation_Type %in% c("Missense", "Silent")) %>%
+    group_by(mut_class = Mutation_Type) %>%
+    summarise(
+      n = n(),
+      n_singleton = sum(singleton, na.rm = TRUE),
+      pct_singleton = round(100 * mean(singleton, na.rm = TRUE), 1),
+      .groups = "drop"
+    )
+) %>%
+  arrange(factor(mut_class, levels = c("PTV", "Missense", "Silent")))
+
+# 4) All alleles ranked by AC; PTVs ranked by AC; top 10 overall + top 10 PTV
+gnomad_alleles_ranked <- g %>%
+  arrange(desc(Allele.Count), desc(Allele.Frequency)) %>%
+  mutate(rank = row_number()) %>%
+  transmute(
+    rank,
+    DNA_variant = `DNA variant`,
+    Protein_Consequence = Protein.Consequence,
+    Mutation_Type,
+    Allele.Count,
+    Allele.Number,
+    Allele.Frequency,
+    ClinVar = ClinVar.Germline.Classification,
+    Protein_Length_aa = `Protein Length aa`,
+    gnomAD.ID
+  )
+
+gnomad_ptvs_ranked <- g %>%
+  filter(mut_class == "PTV") %>%
+  arrange(desc(Allele.Count), desc(Allele.Frequency)) %>%
+  mutate(
+    rank = row_number(),
+    singleton = Allele.Count == 1
+  ) %>%
+  transmute(
+    rank,
+    DNA_variant = `DNA variant`,
+    Protein_Consequence = Protein.Consequence,
+    Mutation_Type,
+    Allele.Count,
+    Allele.Number,
+    Allele.Frequency,
+    singleton,
+    ClinVar = ClinVar.Germline.Classification,
+    Protein_Length_aa = `Protein Length aa`,
+    gnomAD.ID
+  )
+
+top10_block <- function(df, set_name) {
+  df %>%
+    slice_head(n = 10) %>%
+    mutate(set = set_name, rank_within_set = row_number()) %>%
+    select(
+      set, rank_within_set, DNA_variant, Protein_Consequence, Mutation_Type,
+      Allele.Count, Allele.Number, Allele.Frequency, ClinVar,
+      Protein_Length_aa, gnomAD.ID
+    )
+}
+
+gnomad_top10 <- bind_rows(
+  top10_block(gnomad_alleles_ranked, "overall"),
+  top10_block(gnomad_ptvs_ranked, "PTV")
+)
+
+write_csv(by_type, file.path(tables_dir, "gnomad_by_mutation_type.csv"))
+write_csv(by_class_clinvar, file.path(tables_dir, "gnomad_by_class_clinvar.csv"))
+write_csv(by_singleton, file.path(tables_dir, "gnomad_singleton_by_class.csv"))
+write_csv(gnomad_alleles_ranked, file.path(tables_dir, "gnomad_alleles_ranked_by_AC.csv"))
+write_csv(gnomad_ptvs_ranked, file.path(tables_dir, "gnomad_PTVs_ranked_by_AC.csv"))
+write_csv(gnomad_top10, file.path(tables_dir, "gnomad_top10_AC_overall_and_PTV.csv"))
+
+by_type
+by_class_clinvar
+by_singleton
+
+# --- Allele count pnael: non-PTV vs PTV, colored by ClinVar ---
+clinvar_levels <- c("Unannotated", "VUS", "P/LP", "Benign/LB")
+# Conflicting plotted with Unannotated
+clinvar_cols <- c(
+  "Unannotated" = "#BEBDBD",
+  "VUS" = "#282a74",
+  "P/LP" = "#d12026",
+  "Benign/LB" = "#49b749"
+)
+clinvar_labs <- c(
+  "Unannotated" = "Unannotated / conflicting",
+  "VUS" = "VUS",
+  "P/LP" = "P / LP",
+  "Benign/LB" = "Benign / LB"
+)
+
+plot_df <- g %>%
+  mutate(
+    is_PTV = Mutation_Type %in% c("Nonsense", "Frameshifting indel"),
+    cdna_pos = as.integer(str_match(`DNA variant`, "c\\.(\\d+)")[, 2]),
+    clin_raw = ClinVar.Germline.Classification,
+    clinvar_cat = case_when(
+      is.na(clin_raw) | clin_raw == "" ~ "Unannotated",
+      str_detect(clin_raw, "Conflicting") ~ "Unannotated",
+      clin_raw == "Uncertain significance" ~ "VUS",
+      str_detect(clin_raw, "athogenic") ~ "P/LP",
+      str_detect(clin_raw, "enign") ~ "Benign/LB",
+      TRUE ~ "Unannotated"
+    ),
+    clinvar_cat = factor(clinvar_cat, levels = clinvar_levels)
+  ) %>%
+  filter(!is.na(cdna_pos), !is.na(Allele.Count))
+
+CDS_LEN <- max(plot_df$cdna_pos, na.rm = TRUE)
+HW <- 0.28
+x_nonptv <- 0
+x_ptv <- 1.35
+
+plot_df <- plot_df %>%
+  mutate(
+    x = ifelse(is_PTV, x_ptv, x_nonptv) + (cdna_pos / CDS_LEN - 0.5) * 2 * HW
+  ) %>%
+  arrange(clinvar_cat)
+
+label_ann <- plot_df %>%
+  filter(is_PTV) %>%
+  slice_max(Allele.Count, n = 2, with_ties = TRUE) %>%
+  distinct(`DNA variant`, .keep_all = TRUE) %>%
+  arrange(desc(Allele.Count), `DNA variant`) %>%
+  mutate(
+    x_lab = x_ptv + HW + 0.12,
+    y_lab = c(180, 55)
+  )
+
+p_ac <- ggplot(plot_df, aes(x = x, y = Allele.Count, colour = clinvar_cat)) +
+  geom_point(size = 1.5, alpha = 0.5, shape = 16) +
+  geom_segment(
+    data = label_ann,
+    aes(x = x, y = Allele.Count, xend = x_lab - 0.02, yend = y_lab),
+    inherit.aes = FALSE,
+    linewidth = 0.3,
+    colour = "grey40"
+  ) +
+  geom_text(
+    data = label_ann,
+    aes(x = x_lab, y = y_lab, label = `DNA variant`),
+    inherit.aes = FALSE,
+    hjust = 0,
+    size = 2,
+    colour = "black",
+    family = "Arial",
+    fontface = "bold"
+  ) +
+  scale_colour_manual(
+    values = clinvar_cols,
+    labels = clinvar_labs,
+    name = NULL
+  ) +
+  scale_x_continuous(
+    breaks = c(x_nonptv, x_ptv),
+    labels = c("non-PTV", "PTV"),
+    limits = c(x_nonptv - HW - 0.15, x_ptv + HW + 0.95)
+  ) +
+  scale_y_log10(
+    breaks = c(1, 10, 100, 1e3, 1e4, 1e5),
+    labels = c(
+      expression(10^0), expression(10^1), expression(10^2),
+      expression(10^3), expression(10^4), expression(10^5)
+    ),
+    limits = c(0.7, 1.3e5),
+    minor_breaks = as.vector(outer(2:9, 10^(0:4), `*`))
+  ) +
+  annotation_logticks(
+    sides = "l",
+    short = unit(0.5, "mm"),
+    mid = unit(0.8, "mm"),
+    long = unit(1.2, "mm"),
+    linewidth = 0.3
+  ) +
+  coord_cartesian(clip = "off") +
+  labs(x = NULL, y = "allele count") +
+  theme_classic(base_size = 12, base_family = "Arial") +
+  theme(
+    text = element_text(family = "Arial", face = "bold"),
+    legend.position = "bottom",
+    legend.direction = "vertical",
+    legend.text = element_text(size = 7, family = "Arial", face = "bold"),
+    legend.key.size = unit(0.35, "cm"),
+    legend.margin = margin(0, 0, 0, 0),
+    axis.text = element_text(colour = "black", family = "Arial", face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    axis.title = element_text(family = "Arial", face = "bold"),
+    axis.ticks.length = unit(1.5, "pt"),
+    plot.margin = margin(4, 28, 4, 4)
+  ) +
+  guides(colour = guide_legend(override.aes = list(size = 2, alpha = 1)))
+
+ggsave(
+  file.path(plots_dir, "gnomad_AC_PTV_clinvar.pdf"),
+  p_ac,
+  width = 2.4,
+  height = 2.6,
+  device = cairo_pdf
+)
+ggsave(
+  file.path(plots_dir, "gnomad_AC_PTV_clinvar.png"),
+  p_ac,
+  width = 2.4,
+  height = 2.6,
+  dpi = 1200,
+  type = "cairo"
+)
 ```
 
 ### Lethal versus non-lethal cases
@@ -3085,95 +3450,19 @@ ggsave(
 )
 ```
 
-## Figure 3D: Mixed-type association heatmap (selected protein properties)
+## Protein property pairwise associations
 
-```{r mixed-association-heatmap-selected-vars, fig.width=9, fig.height=8, message=FALSE, warning=FALSE}
+Pairwise association strength (0–1) for selected protein features, using Spearman |ρ| (continuous–continuous), eta-squared (continuous–categorical), or Cramér's V (categorical–categorical).
+
+```{r protein-property-pairwise-associations, message=FALSE, warning=FALSE}
 library(dplyr)
-library(tidyr)
-library(ComplexHeatmap)
-library(circlize)
-library(grid)
+library(readr)
 
-# Variables requested for the mixed-type association heatmap
 selected_features <- c(
   "Protein_Length_[aa]",
   "Lost_Functional_Domains",
   "lost_signals"
 )
-
-assoc_df <- results_df %>%
-  select(all_of(selected_features)) %>%
-  mutate(
-    across(where(is.character), ~ na_if(trimws(.x), "")),
-    across(where(is.character), as.factor)
-  )
-
-to_factor_clean <- function(x) {
-  if (is.factor(x)) return(droplevels(x))
-  factor(as.character(x))
-}
-
-cramers_v <- function(x, y) {
-  ok <- complete.cases(x, y)
-  x <- x[ok]
-  y <- y[ok]
-  if (length(x) < 3) return(NA_real_)
-
-  tab <- table(to_factor_clean(x), to_factor_clean(y))
-  n <- sum(tab)
-  if (n == 0) return(NA_real_)
-  if (nrow(tab) < 2 || ncol(tab) < 2) return(NA_real_)
-
-  chi <- suppressWarnings(chisq.test(tab, correct = FALSE)$statistic)
-  if (is.na(chi)) return(NA_real_)
-  phi2 <- as.numeric(chi) / n
-  k <- min(nrow(tab) - 1, ncol(tab) - 1)
-  if (k <= 0) return(NA_real_)
-  sqrt(phi2 / k)
-}
-
-eta_squared <- function(x_num, y_cat) {
-  ok <- complete.cases(x_num, y_cat)
-  x_num <- x_num[ok]
-  y_cat <- y_cat[ok]
-  if (length(x_num) < 3) return(NA_real_)
-
-  y_cat <- to_factor_clean(y_cat)
-  if (nlevels(y_cat) < 2) return(NA_real_)
-  if (sd(x_num) == 0) return(NA_real_)
-
-  fit <- tryCatch(lm(x_num ~ y_cat), error = function(e) NULL)
-  if (is.null(fit)) return(NA_real_)
-
-  aov_tab <- anova(fit)
-  ss_between <- aov_tab$`Sum Sq`[1]
-  ss_total <- sum(aov_tab$`Sum Sq`)
-  if (is.na(ss_between) || is.na(ss_total) || ss_total == 0) return(NA_real_)
-  max(0, min(1, ss_between / ss_total))
-}
-
-assoc_value <- function(x, y, tx, ty) {
-  if (tx == "continuous" && ty == "continuous") {
-    ok <- complete.cases(x, y)
-    if (sum(ok) < 3) return(NA_real_)
-    r <- suppressWarnings(cor(x[ok], y[ok], method = "spearman"))
-    return(abs(as.numeric(r)))
-  }
-
-  if (tx == "continuous" && ty == "categorical") {
-    return(eta_squared(as.numeric(x), y))
-  }
-
-  if (ty == "continuous" && tx == "categorical") {
-    return(eta_squared(as.numeric(y), x))
-  }
-
-  if (tx == "categorical" && ty == "categorical") {
-    return(cramers_v(x, y))
-  }
-
-  NA_real_
-}
 
 feature_types <- c(
   "Protein_Length_[aa]" = "continuous",
@@ -3181,98 +3470,86 @@ feature_types <- c(
   "lost_signals" = "categorical"
 )
 
-# Basic validation: categorical vars need at least two observed levels
-cat_vars <- names(feature_types)[feature_types == "categorical"]
-for (v in cat_vars) {
-  n_lvl <- nlevels(to_factor_clean(assoc_df[[v]][!is.na(assoc_df[[v]])]))
-  if (n_lvl < 2) stop(paste0("Categorical variable '", v, "' has fewer than two observed levels."))
-}
+feature_labels <- c(
+  "Protein_Length_[aa]" = "Protein length (aa)",
+  "Lost_Functional_Domains" = "Lost functional domains",
+  "lost_signals" = "Lost nuclear signals"
+)
 
-cont_vars <- names(feature_types)[feature_types == "continuous"]
-for (v in cont_vars) {
-  if (sum(!is.na(assoc_df[[v]])) < 3) stop(paste0("Continuous variable '", v, "' has too few non-missing values."))
-}
+assoc_df <- results_df %>%
+  select(all_of(selected_features)) %>%
+  mutate(across(where(is.character), ~ na_if(trimws(.x), "")))
 
-p <- length(selected_features)
-assoc_mat <- matrix(NA_real_, nrow = p, ncol = p, dimnames = list(selected_features, selected_features))
+pairwise_assoc <- function(x, y, tx, ty) {
+  ok <- complete.cases(x, y)
+  x <- x[ok]
+  y <- y[ok]
+  n <- length(x)
+  if (n < 3) {
+    return(list(n = n, metric = NA_character_, association_strength = NA_real_))
+  }
 
-for (i in seq_len(p)) {
-  assoc_mat[i, i] <- 1
-  if (i < p) {
-    for (j in (i + 1):p) {
-      vi <- selected_features[i]
-      vj <- selected_features[j]
-      xi <- assoc_df[[vi]]
-      xj <- assoc_df[[vj]]
-      aij <- assoc_value(xi, xj, feature_types[vi], feature_types[vj])
-      assoc_mat[i, j] <- aij
-      assoc_mat[j, i] <- aij
+  if (tx == "continuous" && ty == "continuous") {
+    r <- suppressWarnings(cor(as.numeric(x), as.numeric(y), method = "spearman"))
+    return(list(n = n, metric = "Spearman |rho|", association_strength = abs(r)))
+  }
+
+  if (tx == "categorical" && ty == "categorical") {
+    tab <- table(factor(x), factor(y))
+    if (nrow(tab) < 2 || ncol(tab) < 2) {
+      return(list(n = n, metric = "Cramer's V", association_strength = NA_real_))
     }
+    chi <- suppressWarnings(chisq.test(tab, correct = FALSE)$statistic)
+    phi2 <- as.numeric(chi) / n
+    k <- min(nrow(tab) - 1, ncol(tab) - 1)
+    v <- if (k > 0) sqrt(phi2 / k) else NA_real_
+    return(list(n = n, metric = "Cramer's V", association_strength = v))
+  }
+
+  num <- if (tx == "continuous") as.numeric(x) else as.numeric(y)
+  cat <- if (tx == "categorical") factor(x) else factor(y)
+  if (nlevels(cat) < 2 || sd(num) == 0) {
+    return(list(n = n, metric = "Eta-squared", association_strength = NA_real_))
+  }
+  fit <- tryCatch(lm(num ~ cat), error = function(e) NULL)
+  if (is.null(fit)) {
+    return(list(n = n, metric = "Eta-squared", association_strength = NA_real_))
+  }
+  ss <- anova(fit)$`Sum Sq`
+  eta2 <- max(0, min(1, ss[1] / sum(ss)))
+  list(n = n, metric = "Eta-squared", association_strength = eta2)
+}
+
+assoc_results <- vector("list", length(selected_features) * (length(selected_features) + 1) / 2)
+k <- 1L
+for (i in seq_along(selected_features)) {
+  for (j in seq(i, length(selected_features))) {
+    f1 <- selected_features[i]
+    f2 <- selected_features[j]
+    t1 <- unname(feature_types[f1])
+    t2 <- unname(feature_types[f2])
+    res <- pairwise_assoc(assoc_df[[f1]], assoc_df[[f2]], t1, t2)
+    assoc_results[[k]] <- tibble(
+      feature_1 = f1,
+      feature_1_label = unname(feature_labels[f1]),
+      type_1 = t1,
+      feature_2 = f2,
+      feature_2_label = unname(feature_labels[f2]),
+      type_2 = t2,
+      metric = res$metric,
+      association_strength = if (f1 == f2) 1 else res$association_strength,
+      n = res$n
+    )
+    k <- k + 1L
   }
 }
 
-assoc_for_cluster <- assoc_mat
-assoc_for_cluster[is.na(assoc_for_cluster)] <- 0
+assoc_results <- bind_rows(assoc_results) %>%
+  arrange(desc(association_strength), feature_1, feature_2)
 
-dist_mat <- as.dist(1 - assoc_for_cluster)
-hc <- hclust(dist_mat, method = "average")
-
-type_cols <- c(
-  continuous = "#1f78b4",
-  categorical = "#ff7f00"
-)
-
-ha_top <- HeatmapAnnotation(
-  `Feature type` = factor(feature_types[colnames(assoc_mat)], levels = c("continuous", "categorical")),
-  col = list(`Feature type` = type_cols),
-  annotation_name_gp = gpar(fontsize = 9, fontface = "bold")
-)
-
-ha_row <- rowAnnotation(
-  `Feature type` = factor(feature_types[rownames(assoc_mat)], levels = c("continuous", "categorical")),
-  col = list(`Feature type` = type_cols),
-  annotation_name_gp = gpar(fontsize = 9, fontface = "bold")
-)
-
-col_fun <- colorRamp2(c(0, 1), c("white", "black"))
-
-ht <- Heatmap(
-  assoc_mat,
-  name = "Association\nstrength",
-  col = col_fun,
-  na_col = "#f0f0f0",
-  rect_gp = gpar(col = "white", lwd = 1),
-  cluster_rows = as.dendrogram(hc),
-  cluster_columns = as.dendrogram(hc),
-  show_row_dend = TRUE,
-  show_column_dend = TRUE,
-  row_names_gp = gpar(fontsize = 9),
-  column_names_gp = gpar(fontsize = 9),
-  column_names_rot = 45,
-  top_annotation = ha_top,
-  right_annotation = ha_row,
-  heatmap_legend_param = list(at = c(0, 0.25, 0.5, 0.75, 1)),
-  cell_fun = function(j, i, x, y, width, height, fill) {
-    value <- assoc_mat[i, j]
-    if (is.finite(value)) {
-      grid.text(sprintf("%.2f", value), x, y, gp = gpar(fontsize = 9, col = "white", fontface = "bold"))
-    }
-  }
-)
-
-draw(ht)
-
-assoc_dir <- file.path(plots_dir, "association_heatmap")
-dir.create(assoc_dir, recursive = TRUE, showWarnings = FALSE)
-
-pdf(
-  file = file.path(assoc_dir, "protein_property_mixed_association_heatmap_selected_vars.pdf"),
-  width = 9,
-  height = 8,
-  bg = "white"
-)
-draw(ht)
-dev.off()
+out_file <- file.path(tables_dir, "protein_property_pairwise_associations.csv")
+write_csv(assoc_results, out_file)
+message("Protein property pairwise associations saved to: ", out_file)
 ```
 
 ## Figure S2: Correlogram
@@ -3605,7 +3882,7 @@ load_latest_workspace()
 
 ```
 
-# Analysis of FOXG1 and MKRN3 cohorts
+## Analysis of FOXG1 and MKRN3 cohorts
 
 ```{r foxg1-analysis}
 
@@ -4308,4 +4585,143 @@ write.csv(tidy_tbl, file.path(out_dir, "mkrn3_geno_pheno_correlations_long_with_
 
 # plot
 plot_correlogram_square(cor_mat, p_mat, "mkrn3_geno_pheno_correlogram.pdf")
+```
+
+## Nested model comparison among PTVs
+
+Sensitivity analysis among PTVs: whether variant type × locus improves severity models beyond protein length × sex, and whether protein length improves beyond variant type × locus × sex.
+
+```{r severity-ptv-nested-anova, message=FALSE, warning=FALSE}
+library(dplyr)
+library(readr)
+
+df_sev <- results_df %>%
+  filter(!is.na(severity), max_achievable_points >= 10) %>%
+  mutate(sex = factor(sex, levels = c("f", "m")))
+
+df_ptv <- df_sev %>%
+  filter(Mutation_Type %in% c("Frameshifting indel", "Nonsense")) %>%
+  mutate(Mutation_Type = factor(Mutation_Type))
+
+nested_p <- function(small, large) {
+  as.numeric(anova(small, large)$"Pr(>F)"[2])
+}
+
+cor_pl_locus <- cor(df_ptv$`Protein_Length_[aa]`, df_ptv$Locus, use = "complete.obs")
+
+pl_x_sex <- lm(severity ~ `Protein_Length_[aa]` * sex, data = df_ptv)
+pl_x_sex_tl <- lm(
+  severity ~ `Protein_Length_[aa]` * sex + Mutation_Type * Locus,
+  data = df_ptv
+)
+tl_x_sex <- lm(severity ~ Mutation_Type * Locus * sex, data = df_ptv)
+pl_tl_x_sex <- lm(
+  severity ~ `Protein_Length_[aa]` + Mutation_Type * Locus * sex,
+  data = df_ptv
+)
+
+severity_ptv_nested_anova <- tibble(
+  cohort = "PTV only",
+  comparison = c(
+    "Type x Locus beyond protein length x sex",
+    "Protein length beyond type x Locus x sex"
+  ),
+  smaller_model = c(
+    "severity ~ Protein_Length_[aa] * sex",
+    "severity ~ Mutation_Type * Locus * sex"
+  ),
+  larger_model = c(
+    "severity ~ Protein_Length_[aa] * sex + Mutation_Type * Locus",
+    "severity ~ Protein_Length_[aa] + Mutation_Type * Locus * sex"
+  ),
+  test_used = "Nested ANOVA",
+  nested_p = c(nested_p(pl_x_sex, pl_x_sex_tl), nested_p(tl_x_sex, pl_tl_x_sex)),
+  n = nrow(df_ptv),
+  cor_pl_locus = cor_pl_locus,
+  k_smaller_model = c(length(coef(pl_x_sex)), length(coef(tl_x_sex))),
+  k_larger_model = c(length(coef(pl_x_sex_tl)), length(coef(pl_tl_x_sex)))
+) %>%
+  mutate(
+    k_added = k_larger_model - k_smaller_model,
+    cor_pl_locus = round(cor_pl_locus, 3),
+    nested_p = signif(nested_p, 3)
+  )
+
+print(severity_ptv_nested_anova)
+write_csv(severity_ptv_nested_anova, file.path(tables_dir, "severity_ptv_nested_anova.csv"))
+```
+
+## Power for variant type and SYS severity
+
+Retrospective power planning for the one-way variant-type ANOVA (ΔS = 0.15 on the 0–1 severity scale). 
+
+```{r severity-variant-type-power, message=FALSE, warning=FALSE}
+library(dplyr)
+library(readr)
+
+df_sev <- results_df %>%
+  filter(!is.na(severity), max_achievable_points >= 10) %>%
+  mutate(sex = factor(sex, levels = c("f", "m")))
+
+d_vt <- df_sev[df_sev$Mutation_Type %in% names(which(table(df_sev$Mutation_Type) >= 5)), ]
+d_vt$Mutation_Type <- factor(d_vt$Mutation_Type)
+fit <- lm(severity ~ Mutation_Type, data = d_vt)
+sigma <- summary(fit)$sigma
+df2 <- df.residual(fit)
+ns <- as.integer(table(d_vt$Mutation_Type))
+names(ns) <- names(table(d_vt$Mutation_Type))
+
+delta <- 0.15
+half <- delta / 2
+
+configs <- list(
+  missense_middle = c(
+    `Frameshifting indel` = -half, Missense = 0, Nonsense = half
+  ),
+  nonsense_middle = c(
+    `Frameshifting indel` = -half, Missense = half, Nonsense = 0
+  ),
+  frameshift_middle = c(
+    `Frameshifting indel` = 0, Missense = -half, Nonsense = half
+  )
+)
+
+config_label <- c(
+  missense_middle = "Missense in middle, frameshift and nonsense at extremes",
+  nonsense_middle = "Nonsense in middle, frameshift and missense at extremes",
+  frameshift_middle = "Frameshift in middle, missense and nonsense at extremes"
+)
+
+severity_variant_type_power <- lapply(names(configs), function(cfg) {
+  mus <- configs[[cfg]][names(ns)]
+  mu_bar <- sum(ns * mus) / sum(ns)
+  lam <- sum(ns * (mus - mu_bar)^2) / sigma^2
+  tibble(
+    configuration = config_label[cfg],
+    lambda = round(lam, 2),
+    power_alpha_0.05 = round(1 - pf(qf(0.95, 2, df2), 2, df2, ncp = lam), 3),
+    power_alpha_0.10 = round(1 - pf(qf(0.90, 2, df2), 2, df2, ncp = lam), 3)
+  )
+}) %>%
+  bind_rows()
+
+# Prospective balanced n/group at 80% power. In a balanced design
+# Σ(μᵢ − μ̄)² = δ²/2 for every permutation, so n is invariant to configuration.
+n_for_80 <- function(alpha) {
+  for (n in 5:500) {
+    lam_n <- n * (delta^2 / 2) / sigma^2
+    if (1 - pf(qf(1 - alpha, 2, 3 * n - 3), 2, 3 * n - 3, lam_n) >= 0.8) {
+      return(as.integer(n))
+    }
+  }
+}
+
+severity_variant_type_power <- severity_variant_type_power %>%
+  mutate(
+    n_per_group_80_alpha_0.05 = n_for_80(0.05),
+    n_per_group_80_alpha_0.10 = n_for_80(0.10)
+  )
+
+print(severity_variant_type_power)
+write_csv(severity_variant_type_power, file.path(tables_dir, "severity_variant_type_power.csv"))
 ```
